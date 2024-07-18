@@ -15,13 +15,11 @@ from .optimizer import _zero_grad_group_helper
 __all__ = ['OffloadDistributedOptimizer']
 class OffloadDistributedOptimizer(DistributedOptimizer):
 
-    @classmethod
     def _build_model_and_main_param_groups(
-        cls,
+        self,
         gbuf_ranges: List[Dict],
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
-        cpu_offload_fraction: float = 0.5
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -56,6 +54,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 numel_for_model_params[id(model_param)] = model_param.numel()
 
         total_numel = sum(numel_for_model_params.values())
+        cpu_offload_fraction = self.cpu_offload_fraction
         cpu_numel = int(cpu_offload_fraction * total_numel)
         offload_model_param_ids = []
         cur_cpu_numel = 0
@@ -209,10 +208,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         # TODO: It'd better to combine these two buffers.
         self.shard_fp32_from_float16_groups, self.shard_fp32_from_float32_groups = self.shard_fp32_from_float16_groups
         
-        
-        
-        pass
-
     def zero_grad(self, set_to_none: bool = True):
         """
         Zeroes grads for the model related parameters, i.e., model_float16_groups
