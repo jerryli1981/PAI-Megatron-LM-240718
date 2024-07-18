@@ -100,6 +100,12 @@ class OptimizerConfig:
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute in distributed optimizer."""
 
+    cpu_offload_policy: str = 'static'
+    """CPU Offload Policy used by OffloadDistributedOptimizer, valid if base optimizer is HybridAdam"""
+
+    cpu_offload_fraction: float = 0.0
+    """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
+
     ################
     # Miscellaneous
     ################

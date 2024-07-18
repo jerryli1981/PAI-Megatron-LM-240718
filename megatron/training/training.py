@@ -721,6 +721,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         'optimizer-clip-main-grad',
         'optimizer-count-zeros',
         'optimizer-inner-step',
+        'optimizer-copy-grad-to-cpu-and-gpu',
         'optimizer-copy-main-to-model-params',
         'optimizer']
 

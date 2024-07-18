@@ -34,7 +34,7 @@ from ..distributed import ParamAndGradBuffer, shard_buffer
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 from .optimizer_config import OptimizerConfig
-
+from .hybrid_adam import CPUAdam
 logger = getLogger(__name__)
 
 
@@ -419,7 +419,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         assert isinstance(
-            optimizer, Adam
+            optimizer, (Adam, CPUAdam)
         ), "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.

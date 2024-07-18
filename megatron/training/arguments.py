@@ -1148,7 +1148,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'hybridadam'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
@@ -1470,6 +1470,13 @@ def _add_distributed_args(parser):
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
                         'with this option enabled')
+    group.add_argument('--cpu-offload-policy', default='static', type=str, 
+                        help='CPU Offload Policy used by OffloadDistributedOptimizer, '
+                        'valid if base optimizer is HybridAdam.')
+    group.add_argument('--cpu-offload-fraction', type=float, default=0.5,
+                       help='CPU Offload Fraction used by static offload policy, '
+                       'valid if base optimizer is HybridAdam')    
+
     return parser
 
 
