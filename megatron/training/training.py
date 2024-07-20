@@ -60,6 +60,7 @@ from .global_vars import (
     get_one_logger)
 from . import one_logger_utils
 
+from megatron.training.memory_tracer.memstats_collector import MemStatsCollector
 
 stimer = StragglerDetector()
 
@@ -580,7 +581,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, memory_stats_collector):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -615,6 +616,8 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    memory_stats_collector.finish_collection()
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
@@ -1028,6 +1031,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
+    memory_stats_collector = MemStatsCollector()
+    if args.optimizer == 'hybridadam':
+        memory_stats_collector.start_collection()
+
     # Singleton Initialization
     if args.log_straggler:
         global stimer
@@ -1094,7 +1101,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
+                       config,
+                       memory_stats_collector)
         iteration += 1
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
