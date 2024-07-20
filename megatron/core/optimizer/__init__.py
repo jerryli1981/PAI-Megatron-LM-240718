@@ -192,6 +192,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
+    cpu_offload = None
     if config.optimizer == 'adam':
         optimizer = Adam(
             param_groups,
