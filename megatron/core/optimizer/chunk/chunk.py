@@ -72,14 +72,14 @@ class Chunk:
 
         self.dtype = dtype
 
-        self._cpu_data = None
+        
         self._target_device = _to_device_obj(init_device or torch.cuda.current_device())
 
         # NOTE: always initialize on cuda but move to the target device if needed
-        self._cuda_data = torch.zeros(
-            chunk_size, dtype=self.dtype, device=_to_device_obj(torch.cuda.current_device()))  # keep all zero
+        self._cpu_data = torch.zeros(chunk_size, dtype=self.dtype)
+        self._cuda_data = None  # keep all zero
         self._closed = False
-        self.chunk_mem = self.chunk_size * self._cuda_data.element_size()
+        self.chunk_mem = self.chunk_size * self._cpu_data.element_size()
 
         # each tensor is associated with a TensorInfo to track its meta info
         # (state, offset, end)
@@ -128,7 +128,7 @@ class Chunk:
         """
         if self._closed:
             return self._target_device.type
-        return "cuda"
+        return "cpu"
 
     def reset_device(self, device: torch.DeviceObjType, async_move: bool=True):
         self._target_device = _to_device_obj(device)
@@ -142,8 +142,8 @@ class Chunk:
             tensor (torch.Tensor): a tensor to be added to the chunk
         """
         # sanity check
-        assert tensor.device.type == 'cuda', "Only support append cuda tensor!"
-        assert tensor.dtype == self._cuda_data.dtype
+        # assert tensor.device.type == 'cuda', "Only support append cuda tensor!"
+        assert tensor.dtype == self._cpu_data.dtype
         assert not self._closed
         new_utilized_size = self.utilized_size + tensor.numel()
         # raise exception when the chunk size is exceeded
@@ -151,11 +151,11 @@ class Chunk:
             raise ChunkFullError
 
         # Here is possibly a D2D, D2H, H2D copy
-        self._cuda_data[self.utilized_size : new_utilized_size].copy_(
+        self._cpu_data[self.utilized_size : new_utilized_size].copy_(
             tensor.data.flatten(), non_blocking=is_async
         )
 
-        tensor.data = self._cuda_data[self.utilized_size : new_utilized_size].view(tensor.shape)
+        tensor.data = self._cpu_data[self.utilized_size : new_utilized_size].view(tensor.shape)
 
         # record all the information about the tensor
         self.num_tensors += 1
@@ -169,7 +169,7 @@ class Chunk:
         if new_utilized_size > self.chunk_size:
             raise ChunkFullError
 
-        new_tensor = self._cuda_data[self.utilized_size : new_utilized_size].view(tensor_size)
+        new_tensor = self._cpu_data[self.utilized_size : new_utilized_size].view(tensor_size)
         self.num_tensors += 1
         self.tensors_info[new_tensor] = TensorInfo(self.utilized_size, new_utilized_size)
         self.utilized_size = new_utilized_size
