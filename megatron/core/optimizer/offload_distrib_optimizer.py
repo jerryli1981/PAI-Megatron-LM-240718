@@ -213,6 +213,15 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             data_parallel_group_idx
         )
 
+        # In bf16 model training
+        self.grad_dtype_in_buffer = None
+        for _, buffers in per_model_buffers.items():
+            for buffer in buffers:
+                if self.grad_dtype_in_buffer is not None:
+                    assert buffer.grad_dtype == self.grad_dtype_in_buffer, "Currently only support consistent grad dtype!"
+                self.grad_dtype_in_buffer = buffer.grad_dtype
+            
+
         self.chunk_manager = ChunkManager(
             chunk_size=config.cpu_offload_chunk_size \
                 if config.cpu_offload_chunk_size > 0 else ChunkManager.find_best_chunk_size(
@@ -223,7 +232,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     ),
                     512 # NOTE: search chunk size in [32MB, 544MB]
                 ),
-            init_device='cpu'
+            init_device='cpu',
+            is_fp32_grad=self.grad_dtype_in_buffer == torch.float32
         )
 
         # NOTE: Allocate main param shards, all buffer will be on cpu.
@@ -263,7 +273,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
         print('After initialization, parameter chunks use mem: ', self.chunk_manager.total_mem)
         
-    def zero_grad(self):
+    def zero_grad(self, set_to_none=True):
         """
         Zeroes grads for the model related parameters, i.e., model_float16_groups
         and model_fp32_groups. We additionally zero the remaining groups as a
@@ -282,7 +292,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             self.shard_fp32_from_float32_groups
         ):
             for group in groups:
-                _zero_grad_group_helper(group, False)
+                _zero_grad_group_helper(group, set_to_none=set_to_none)
 
         # If overlapping param all-gather with forward compute, launch all-gather
         # for first accessed bucket here before forward compute is initiated.
@@ -382,7 +392,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             timers('optimizer-copy-grad-to-cpu-and-gpu', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+
         # 4. move these grads to CPU
+        self.chunk_manager.attach_grad()
         self._dispatch_grads(params, main_param_id_to_main_grad_mapping)
 
         if timers is not None:
@@ -433,9 +445,10 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             params = self.get_parameters()
         for param in params:
             if id(param) in main_param_id_to_main_grad_mapping:
-                assert param.grad is not None
-                param.grad.data.copy_(main_param_id_to_main_grad_mapping[id(param)])
-
+                if param.grad is None:
+                    param.grad = main_param_id_to_main_grad_mapping[id(param)].to(param.device, non_blocking=True)
+                else:
+                    param.grad.data.copy_(main_param_id_to_main_grad_mapping[id(param)])
 
     def _copy_main_params_to_model_params(self):
         """

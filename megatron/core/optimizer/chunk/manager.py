@@ -25,15 +25,18 @@ class ChunkManager:
         chunk_size: int,
         init_device: Optional[torch.device] = None,
         max_prefetch: int = 0,
-        pin_memory: bool = True
+        pin_memory: bool = True,
+        is_fp32_grad: bool = True
     ) -> None:
         
+        self.__alloc_cuda_grad = not is_fp32_grad
         self.chunk_size = chunk_size
         # NOTE: only used for chunk init, NOT REPRESENT TENSOR DEVICE!
         self.device = init_device or _to_device_obj(torch.cuda.current_device())
         self.chunk_groups: Dict[str, Deque[Chunk]] = dict()
         self.grad_groups: Dict[str, Deque[Chunk]] = dict()
         self.tensor_chunk_map: Dict[torch.Tensor, Chunk] = dict()
+        self.tensor_grad_map: Dict[torch.Tensor, torch.Tensor] = dict()
         
         self.pin_memory = pin_memory
 
@@ -153,14 +156,20 @@ class ChunkManager:
         for group_name, chunk_group in self.chunk_groups.items():
             self.grad_groups[group_name] = deque()
             for chunk in chunk_group:
-                grad_chunk = chunk.clone()
-                self.__add_memory_usage(grad_chunk.memory_usage)
-                self.grad_groups[group_name].append(grad_chunk)
-                
-                for param, grad in zip(chunk.get_tensors(), grad_chunk.get_tensors()):
-                    assert param.shape == grad.shape
-                    param.grad = grad
-
+                if chunk.device_type == 'cpu' or self.__alloc_cuda_grad:
+                    grad_chunk = chunk.clone()
+                    self.__add_memory_usage(grad_chunk.memory_usage)
+                    self.grad_groups[group_name].append(grad_chunk)
+                    
+                    for param, grad in zip(chunk.get_tensors(), grad_chunk.get_tensors()):
+                        self.tensor_chunk_map[param] = grad
+        
+        self.attach_grad()
+    
+    def attach_grad(self):
+        for param, grad in self.tensor_chunk_map.items():
+            assert param.shape == grad.shape
+            param.grad = grad
 
     def __repr__(self) -> str:
         msg = [
