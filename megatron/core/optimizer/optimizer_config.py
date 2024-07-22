@@ -106,6 +106,9 @@ class OptimizerConfig:
     cpu_offload_fraction: float = 0.0
     """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
 
+    cpu_offload_chunk_size: int = 0
+    """Chunk Size used by CPU offload Chunk Manager, automatically search if value is 0 (default)"""
+
     ################
     # Miscellaneous
     ################

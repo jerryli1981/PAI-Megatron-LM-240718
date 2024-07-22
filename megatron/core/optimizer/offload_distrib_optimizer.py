@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from typing import *
@@ -11,11 +12,23 @@ from .optimizer_config import OptimizerConfig
 from .grad_scaler import MegatronGradScaler
 from ..distributed import ParamAndGradBuffer
 from .optimizer import _zero_grad_group_helper
+from .chunk import ChunkManager
 
 __all__ = ['OffloadDistributedOptimizer']
+
 class OffloadDistributedOptimizer(DistributedOptimizer):
 
     def _build_model_and_main_param_groups(
+        self,
+        *args,
+        **kwargs
+    ):  
+        """
+            This function overrides DO._build_model_and_main_param_groups
+        """
+        return None, None, None, None, None
+
+    def _build_model_and_main_param_groups_actual(
         self,
         gbuf_ranges: List[Dict],
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
@@ -44,29 +57,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         shard_fp32_groups = []
         shard_fp32_from_float16_groups = []
         shard_fp32_from_float32_groups = []
-
-        # NOTE: first pass -- collect numel for each parameter tensor
-        numel_for_model_params = {}
-        for group_range in opt_group_ranges:
-            for model_param in group_range["params"]:
-                assert model_param.requires_grad
-                assert id(model_param) not in numel_for_model_params
-                numel_for_model_params[id(model_param)] = model_param.numel()
-
-        total_numel = sum(numel_for_model_params.values())
-        cpu_offload_fraction = self.cpu_offload_fraction
-        cpu_numel = int(cpu_offload_fraction * total_numel)
-        offload_model_param_ids = []
-        cur_cpu_numel = 0
-        if cpu_numel > 0:
-            for k, v in sorted(numel_for_model_params.items(), key=lambda x: x[1], reverse=True):
-                if cur_cpu_numel + v <= cpu_numel:
-                    offload_model_param_ids.append(k)
-                    cur_cpu_numel += v
-
-        # NOTE: Here to log actual cpu faction of this process
-        if torch.distributed.get_rank() == 0:
-            print(f'Fraction is: {cur_cpu_numel / total_numel}')
 
         # Allocate (or slice) each group's param shard.
         for group_range in opt_group_ranges:
@@ -102,10 +92,11 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     shard_model_param = model_param.detach().view(-1)[
                         param_range.start : param_range.end
                     ]
-                    if id(model_param) in offload_model_param_ids:
-                        shard_main_param = shard_model_param.float().cpu()
-                    else:
-                        shard_main_param = shard_model_param.clone().float()
+                    shard_main_param = shard_model_param.clone().float()
+                    self.chunk_manager.register_tensor(
+                        shard_main_param,
+                        'shard_fp32_from_float16_params'
+                    )
 
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
@@ -120,34 +111,29 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
                     shard_float16_params_this_group.append(shard_model_param)
+
+                    # NOTE: view of shard params, possible on CPU or CUDA
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
-                    if id(model_param) in offload_model_param_ids:
-                        # Clone model -> main.
-                        shard_model_param = model_param.detach().view(-1)[
-                            param_range.start : param_range.end
-                        ]
 
-                        shard_main_param = shard_model_param.cpu()
-                        tensor_parallel.copy_tensor_model_parallel_attributes(
-                            shard_model_param, model_param
-                        )
-                        tensor_parallel.copy_tensor_model_parallel_attributes(
-                            shard_main_param, model_param
-                        )
-                        if hasattr(model_param, 'shared'):
-                            shard_model_param.shared = model_param.shared
-                            shard_main_param.shared = model_param.shared
-                    else:
-                        shard_main_param = shard_model_param
-                        tensor_parallel.copy_tensor_model_parallel_attributes(
-                            shard_model_param, model_param
-                        )
-                        if hasattr(model_param, 'shared'):
-                            shard_model_param.shared = model_param.shared
+                    shard_main_param = shard_model_param.clone()
+                    self.chunk_manager.register_tensor(
+                        shard_main_param.clone().float(),
+                        'shard_fp32_from_float16_params'
+                    )
+                    
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
+                        shard_model_param, model_param
+                    )
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
+                        shard_main_param, model_param
+                    )
+                    if hasattr(model_param, 'shared'):
+                        shard_model_param.shared = model_param.shared
+                        shard_main_param.shared = model_param.shared
 
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
@@ -173,10 +159,30 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             model_fp32_groups,
             shard_float16_groups,
             shard_fp32_groups,
-            # NOTE: Here is a hack to reuse super().__init__()
-            (shard_fp32_from_float16_groups, shard_fp32_from_float32_groups)
+            shard_fp32_from_float16_groups, 
+            shard_fp32_from_float32_groups
         )
 
+    def collect_shard_param_numel(
+        self,
+        gbuf_ranges: List[Dict],
+        param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
+        opt_group_ranges: List,
+        ):
+
+        numels = np.zeros([sum(len(group_range["params"]) for group_range in opt_group_ranges)])
+        ptr = 0
+        for group_range in opt_group_ranges:
+            for model_param in group_range["params"]:
+                assert model_param.requires_grad
+
+                gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
+                gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
+                param_range = gbuf_range["param_map"][model_param]["param"]
+                numels[ptr] = param_range.end - param_range.start
+                ptr += 1
+        
+        return numels
         
     def __init__(
             self,
@@ -192,6 +198,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         ):
         self.cpu_offload_fraction = cpu_offload_fraction
         assert 0 <= cpu_offload_fraction <= 1, "Offload fraction should be in [0, 1] !"
+
         assert isinstance(
             optimizer, CPUAdam
         ), "Only CPUAdam currently supported, due to checkpointing requirements."        
@@ -205,10 +212,68 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             data_parallel_group_gloo,
             data_parallel_group_idx
         )
-        # TODO: It'd better to combine these two buffers.
-        self.shard_fp32_from_float16_groups, self.shard_fp32_from_float32_groups = self.shard_fp32_from_float16_groups
+
+        # In bf16 model training
+        self.grad_dtype_in_buffer = None
+        for _, buffers in per_model_buffers.items():
+            for buffer in buffers:
+                if self.grad_dtype_in_buffer is not None:
+                    assert buffer.grad_dtype == self.grad_dtype_in_buffer, "Currently only support consistent grad dtype!"
+                self.grad_dtype_in_buffer = buffer.grad_dtype
+            
+
+        self.chunk_manager = ChunkManager(
+            chunk_size=config.cpu_offload_chunk_size \
+                if config.cpu_offload_chunk_size > 0 else ChunkManager.find_best_chunk_size(
+                    self.collect_shard_param_numel(
+                        self.gbuf_ranges,
+                        self.model_param_gbuf_map,
+                        self.opt_group_ranges
+                    ),
+                    512 # NOTE: search chunk size in [32MB, 544MB]
+                ),
+            init_device='cpu',
+            is_fp32_grad=self.grad_dtype_in_buffer == torch.float32
+        )
+
+        # NOTE: Allocate main param shards, all buffer will be on cpu.
+        (
+            self.model_float16_groups,
+            self.model_fp32_groups,
+            self.shard_float16_groups,
+            self.shard_fp32_groups,
+            self.shard_fp32_from_float16_groups,
+            self.shard_fp32_from_float32_groups,
+        ) = self._build_model_and_main_param_groups_actual(
+            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
+        )
+
+        self.chunk_manager.close_all_groups()
+
+        # Update optimizer groups.
+        # - Also, leverage state_dict() and load_state_dict() to
+        #   recast preexisting per-param state tensors.
+        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+        self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        # NOTE: select partial chunks to GPU
+        total_memory = self.chunk_manager.total_mem['cpu']
+        budget = round((1 - cpu_offload_fraction) * total_memory)
+        if budget > 0:
+            for _, chunks in self.chunk_manager.chunk_groups.items():
+                for chunk in chunks:
+                    self.chunk_manager.move_chunk(chunk, torch.cuda.current_device(), True)
+                    if self.chunk_manager.total_mem['cuda'] >= budget:
+                        break
+                if self.chunk_manager.total_mem['cuda'] >= budget:
+                    break            
+
+        # NOTE: alloc grad buffer for each parameter
+        self.chunk_manager.create_grad()
+
+        print('After initialization, parameter chunks use mem: ', self.chunk_manager.total_mem)
         
-    def zero_grad(self, set_to_none: bool = True):
+    def zero_grad(self, set_to_none=True):
         """
         Zeroes grads for the model related parameters, i.e., model_float16_groups
         and model_fp32_groups. We additionally zero the remaining groups as a
@@ -227,7 +292,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             self.shard_fp32_from_float32_groups
         ):
             for group in groups:
-                _zero_grad_group_helper(group, set_to_none)
+                _zero_grad_group_helper(group, set_to_none=set_to_none)
 
         # If overlapping param all-gather with forward compute, launch all-gather
         # for first accessed bucket here before forward compute is initiated.
@@ -327,7 +392,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             timers('optimizer-copy-grad-to-cpu-and-gpu', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+
         # 4. move these grads to CPU
+        self.chunk_manager.attach_grad()
         self._dispatch_grads(params, main_param_id_to_main_grad_mapping)
 
         if timers is not None:
@@ -378,10 +445,10 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             params = self.get_parameters()
         for param in params:
             if id(param) in main_param_id_to_main_grad_mapping:
-                if param.grad is not None:
-                    param.grad.data.copy_(main_param_id_to_main_grad_mapping[id(param)])
+                if param.grad is None:
+                    param.grad = main_param_id_to_main_grad_mapping[id(param)].to(param.device, non_blocking=True)
                 else:
-                    param.grad = main_param_id_to_main_grad_mapping[id(param)].to(param.device)
+                    param.grad.data.copy_(main_param_id_to_main_grad_mapping[id(param)])
 
     def _copy_main_params_to_model_params(self):
         """
