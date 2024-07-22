@@ -272,11 +272,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         ]
         if config.use_distributed_optimizer:
             if cpu_offload:
-                assert config.cpu_offload_policy == 'static', \
-                    "Currently only static policy is valid!"
                 optimizer = OffloadDistributedOptimizer(
                     *optimizer_args,
                     cpu_offload_fraction=config.cpu_offload_fraction,
+                    policy=config.cpu_offload_policy,
                     per_model_buffers=per_model_buffers,
                     data_parallel_group=data_parallel_group,
                     data_parallel_group_gloo=data_parallel_group_gloo,

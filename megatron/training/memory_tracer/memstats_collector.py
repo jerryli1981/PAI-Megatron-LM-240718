@@ -54,6 +54,8 @@ class MemStatsCollector:
     def sampling_time(self):
         return [t - self._sampling_time[0] for t in self._sampling_time]
 
+    # NOTE: called the object with start_collection --> sample_overall_data --> finish_collection
+    # Then self._memstats.non_model_data_list("cuda") will contains non_model_data size during each step
     def start_collection(self):
         self._start_flag = True
         self._mem_monitor.start()
@@ -63,19 +65,22 @@ class MemStatsCollector:
         # self._step_total = len(self._sampling_time)
         self._step_total = len(self._memstats.non_model_data_list("cuda"))
         self._start_flag = False
-        print(f"finish_collection {self._step_total}")
+        # print(f"finish_collection {self._step_total}")
 
     # deprecated
-    def record_model_data_volume(self) -> None:
+    def record_model_data_volume(
+            self, 
+            current_model_data_volume: int,
+            current_optimizer_data_volume: int,
+        ) -> None:
         """
         Sampling model data statistics.
         """
+        # TODO: remove colossal-ai dependency
         if self._start_flag and not self.use_outside_memstats:
-            from colossalai.legacy.zero.gemini import StatefulTensor
-
-            # The following code work for ZeroInitContext, which is deprecated in v0.1.12
-            cuda_mem = StatefulTensor.GST_MGR.total_mem["cuda"]
-            self._memstats.record_max_cuda_model_data(cuda_mem)
+            self._memstats.record_max_cuda_model_data(
+                current_model_data_volume + current_optimizer_data_volume
+            )
 
     def sample_overall_data(self) -> None:
         """

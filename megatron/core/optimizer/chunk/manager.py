@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, defaultdict
 from typing import Deque, Dict, Iterable, Optional, Set, Tuple, List
 import numpy as np
 import torch
@@ -34,9 +34,17 @@ class ChunkManager:
         # NOTE: only used for chunk init, NOT REPRESENT TENSOR DEVICE!
         self.device = init_device or _to_device_obj(torch.cuda.current_device())
         self.chunk_groups: Dict[str, Deque[Chunk]] = dict()
-        self.grad_groups: Dict[str, Deque[Chunk]] = dict()
+        
+        self.param_to_grad_chunk_map: Dict[Chunk, Chunk] = dict()
+
+        # tensor to its corresponding chunk
         self.tensor_chunk_map: Dict[torch.Tensor, Chunk] = dict()
-        self.tensor_grad_map: Dict[torch.Tensor, torch.Tensor] = dict()
+
+        # NOTE: (param chunk -> (param tensor -> param grad))
+        self.tensor_grad_map: Dict[Chunk, Dict[torch.Tensor, torch.Tensor]] = defaultdict(dict)
+
+        # for optimizer state
+        self.paired_chunk_map: Dict[torch.Tensor, List[Chunk]] = defaultdict(list)
         
         self.pin_memory = pin_memory
 
@@ -53,7 +61,8 @@ class ChunkManager:
             group_name: str,
             pin_memory: bool = None
         ):
-
+            # to make sure all tensor in the group have the same dtype
+            group_name = group_name + '_' + str(tensor.dtype)
             chunk_group = self.__get_chunk_group(group_name)
             chunk_size = self.chunk_size
             # NOTE: Next-Fit
@@ -85,14 +94,58 @@ class ChunkManager:
                 chunk.append_tensor(tensor)
                 self.__add_memory_usage(chunk.memory_usage)
 
-            return chunk_group[-1]
+            self.tensor_chunk_map[tensor] = chunk_group[-1]
+            return tensor
+
+    def __find_best_chunk_and_alloc(
+            self, 
+            tensor_size: torch.Tensor,
+            dtype: torch.dtype,
+            group_name: str,
+            pin_memory: bool = None
+        ) -> torch.Tensor:
+            # to make sure all tensor in the group have the same dtype
+            group_name = group_name + '_' + str(dtype)
+            chunk_group = self.__get_chunk_group(group_name)
+            chunk_size = self.chunk_size
+            # NOTE: Next-Fit
+            try:
+                # append the tensor to the last chunk
+                tensor = chunk_group[-1].alloc_tensor(tensor_size)
+            except (IndexError, ChunkFullError):
+                if pin_memory is None:
+                    pin_memory = self.pin_memory
+                # the except statement will be triggered when there is no chunk or
+                # the last chunk in the chunk group is full
+                # this will create a new chunk and allocate this chunk to its corresponding process
+                if chunk_group:
+                    # the chunk group is not empty
+                    # close the last chunk
+                    self.__close_one_chunk(chunk_group[-1])
+
+                if tensor_size.numel() > chunk_size:
+                    chunk_size = tensor_size.numel()
+
+                chunk = Chunk(
+                    chunk_size=chunk_size,
+                    init_device=self.device,
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+
+                chunk_group.append(chunk)
+                tensor = chunk.alloc_tensor(tensor_size)
+                self.__add_memory_usage(chunk.memory_usage)
+            
+            self.tensor_chunk_map[tensor] = chunk_group[-1]
+            return tensor
 
     def register_tensor(
         self,
         tensor: torch.Tensor,
         group_type: str,
         pin_memory: bool = True,
-    ) -> None:
+    ) -> torch.Tensor:
         """
         Register a tensor to the chunk manager.
         Then, the tensor should be accessed by `get_chunks`.
@@ -115,6 +168,33 @@ class ChunkManager:
             pin_memory
         )
 
+    def alloc_tensor(
+        self,
+        tensor_size: torch.Size,
+        dtype: torch.dtype,
+        group_type: str,
+        pin_memory: bool = True,
+    ) -> torch.Tensor:
+        """
+        Alloc a tensor to the chunk manager.
+        Then, the tensor should be accessed by `get_chunks`.
+
+        Args:
+            tensor: the tensor appended to the chunk
+            group_type: the annotation of the group, e.g., data type. The data type in the
+                group should be same.
+            pin_memory: whether the chunk is pinned in the cpu memory
+        """
+        rank = get_rank()
+        group_name = "{}_{}".format(group_type, rank)
+
+        return self.__find_best_chunk_and_alloc(
+            tensor_size,
+            dtype,
+            group_name,
+            pin_memory
+        )
+
     def close_all_groups(self):
         """Close all the chunks of all groups."""
         for group_name in self.chunk_groups:
@@ -122,12 +202,47 @@ class ChunkManager:
 
     def move_chunk(self, chunk: Chunk, device: torch.device, async_move=False) -> None:
         """Move the shard of the chunk to the target device."""
+
+        device = _to_device_obj(device)
+        # NOTE: if a param chunk is moved to cuda, the cpu grad chunk may be dropped
         self.__sub_memory_usage(chunk.memory_usage)
         chunk.reset_device(device, async_move=async_move)
         self.__add_memory_usage(chunk.memory_usage)
+
+        # NOTE: drop or create grad chunk
+        # __alloc_cuda_grad:
+        # False, cpu -> cuda [maybe release cpu chunk], cuda -> cpu [maybe create chunk]
+        # True, cpu -> cuda [move chunk], cuda -> cpu [move chunk]
+
+        # TODO: allow recycle grad chunk to avoid repeated allocation.
+        if self.__alloc_cuda_grad:
+            grad_chunk = self.param_to_grad_chunk_map[chunk]
+            self.__sub_memory_usage(grad_chunk.memory_usage)
+            self.param_to_grad_chunk_map[grad_chunk].reset_device(device, async_move=async_move)
+            self.__add_memory_usage(grad_chunk.memory_usage)
+        elif device.type == 'cuda':
+            if chunk in self.param_to_grad_chunk_map:                
+                grad_chunk = self.param_to_grad_chunk_map.pop(chunk)
+                assert grad_chunk.device_type == 'cpu'
+                self.tensor_grad_map.pop(chunk)
+                self.__sub_memory_usage(grad_chunk.memory_usage)
+            # otherwise try to move a cuda grad chunk to cuda, do nothing
+        else:
+            if chunk not in self.param_to_grad_chunk_map:
+                self.create_grad(chunk)
+            # otherwise try to move a cpu grad chunk to cpu, do nothing
+
+        # NOTE: move optimizer state chunks
+        for paired_chunk in self.paired_chunk_map[chunk]:
+            self.__sub_memory_usage(paired_chunk.memory_usage)
+            paired_chunk.reset_device(device, async_move=async_move)
+            self.__add_memory_usage(paired_chunk.memory_usage)
+
         device = _to_device_obj(device)
         if device.type == 'cuda':
             self.accessed_chunks.add(chunk)
+        else:
+            self.accessed_chunks.remove(chunk)
 
     def get_chunk(self, tensor: torch.Tensor) -> Chunk:
         """
@@ -152,24 +267,27 @@ class ChunkManager:
                 chunks.append(chunk)
         return tuple(chunks)
 
-    def create_grad(self):
+    def create_grads(self):
         for group_name, chunk_group in self.chunk_groups.items():
-            self.grad_groups[group_name] = deque()
+            if 'param' not in group_name:
+                continue
             for chunk in chunk_group:
                 if chunk.device_type == 'cpu' or self.__alloc_cuda_grad:
-                    grad_chunk = chunk.clone()
-                    self.__add_memory_usage(grad_chunk.memory_usage)
-                    self.grad_groups[group_name].append(grad_chunk)
-                    
-                    for param, grad in zip(chunk.get_tensors(), grad_chunk.get_tensors()):
-                        self.tensor_chunk_map[param] = grad
+                    self.create_grad(chunk)
+                                
+    def create_grad(self, param_chunk: Chunk):
+        grad_chunk = param_chunk.clone()
+        self.__add_memory_usage(grad_chunk.memory_usage)
+        self.param_to_grad_chunk_map[param_chunk] = grad_chunk
         
-        self.attach_grad()
-    
+        for param, grad in zip(param_chunk.get_tensors(), grad_chunk.get_tensors()):
+            self.tensor_grad_map[param_chunk][param] = grad
+
     def attach_grad(self):
-        for param, grad in self.tensor_chunk_map.items():
-            assert param.shape == grad.shape
-            param.grad = grad
+        for param_grad_map in self.tensor_grad_map.values():
+            for param, grad in param_grad_map.items():
+                assert param.shape == grad.shape
+                param.grad = grad
 
     def __repr__(self) -> str:
         msg = [
@@ -252,6 +370,25 @@ class ChunkManager:
         
         return results[0][0]
 
+    def alloc_paired_tensors(
+        self,
+        dtype: torch.dtype,
+    ) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+            Alloc paired tensors for each parameter in self.chunk_groups (with same device)
+
+        """
+        tensor_map = {}
+        # NOTE: freeze chunk group for iteration
+        for _, chunk_group in list(self.chunk_groups.items()):
+            for chunk in chunk_group:
+                paired = chunk.clone(dtype)
+                self.__add_memory_usage(paired.memory_usage)
+                for tensor, p in zip(chunk.get_tensors(), paired.get_tensors()):
+                    tensor_map[tensor] = p
+                self.paired_chunk_map[chunk].append(paired)
+
+        return tensor_map
 
 def get_rank():
     if torch.distributed.is_initialized():
