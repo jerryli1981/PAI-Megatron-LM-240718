@@ -17,38 +17,20 @@ class MemStatsCollector:
     It has a Sampling counter which is reset after DNN training iteration.
     """
 
-    def __init__(self, memstats: Optional[MemStats] = None) -> None:
+    def __init__(self) -> None:
         self._mem_monitor = SyncCudaMemoryMonitor()
         self._sampling_time = []
 
         self._start_flag = False
         self._step_idx = 0
         self._step_total = 0
-        if memstats is not None:
-            self.use_outside_memstats = True
-            self._memstats = memstats
-        else:
-            self.use_outside_memstats = False
-            self._memstats = MemStats()
+        self.use_outside_memstats = False
+        self._memstats = MemStats()
+        self._warmup = True
+        self.warmup_memstats = MemStats()
+        self.warmup_memstats._non_model_data_cuda_list.append(0)
 
-    def next_period_non_model_data_usage(self, device_type: str) -> int:
-        """Maximum non model data memory usage during the next Op run
-
-        Args:
-            device_type (str): device type, can be 'cpu' or 'cuda'.
-
-        Returns:
-            int: max non model data memory usage of current sampling period
-        """
-        assert not self._start_flag, "Cannot get mem stats info during collection phase."
-        assert self._step_total > 0, "Cannot get mem stats info before collection phase."
-        assert len(self._memstats.non_model_data_list(device_type)) > self._step_idx, (
-            f"{len(self._memstats.non_model_data_list(device_type))} should be > than step idx {self._step_idx}, "
-            f"step total {self._step_total}"
-        )
-        next_non_model_data = self._memstats.non_model_data_list(device_type)[self._step_idx]
-        self._step_idx = (self._step_idx + 1) % self._step_total
-        return next_non_model_data
+        
 
     @property
     def sampling_time(self):
@@ -101,3 +83,25 @@ class MemStatsCollector:
         self._start_flag = False
         self._step_idx = 0
         self._step_total = 0
+
+    def on_iter_end(self) -> bool:
+        """
+            During warmup, the non-model data is regarded as the amount of non-model data in each step.
+            This strategy is to avoid OOM in the next iteration.
+
+            The warmup ends only when the current max non-model data is no more than amount of last iteration.
+        """
+        in_warmup = self._warmup
+        nmd_cur_iter = self._memstats.max_non_model_data('cuda')
+        nmd_warmup = self.warmup_memstats.max_non_model_data('cuda')
+        self._warmup = nmd_cur_iter > nmd_warmup
+        if self._warmup:
+            self.warmup_memstats.record_max_cuda_model_data(
+                self._memstats._prev_md_cuda
+            )
+            self.warmup_memstats.non_model_data_list('cuda').append(
+                sum(self._memstats.non_model_data_list('cuda'))
+            )
+        # clean memstats
+        self._memstats.clear()
+        return in_warmup

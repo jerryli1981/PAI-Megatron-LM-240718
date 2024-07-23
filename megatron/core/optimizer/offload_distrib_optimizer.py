@@ -567,7 +567,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
     def update_layout(
             self, 
             mem_stats: MemStats = None,
-            threshold: int = 1536 * 1024 ** 2
+            threshold: int = 256 * 1024 ** 2
         ):
         if mem_stats is None:
             return
@@ -578,8 +578,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         chunk_mem = self.chunk_manager.total_mem['cuda']
         non_model_data = mem_stats.max_non_model_data('cuda')
 
-        available_space = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() \
-            - model_data - non_model_data - threshold
+        current_usage = torch.cuda.memory_reserved() - model_data - non_model_data
+        available_space = torch.cuda.mem_get_info()[0] + current_usage - threshold
 
         # if available sapce < 0, move some chunk to CPU
         if available_space < 0:

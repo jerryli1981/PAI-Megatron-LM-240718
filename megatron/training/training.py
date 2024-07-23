@@ -636,7 +636,12 @@ def train_step(forward_step_func, data_iterator,
         model_buffer_param,
         optimizer.chunk_manager.total_mem['cuda'] if hasattr(optimizer, 'chunk_manager') else 0
     )
-    memory_stats_collector.finish_collection()
+
+    memory_stats_collector.sample_overall_data()
+    may_evict_tensor = memory_stats_collector.on_iter_end()
+    if may_evict_tensor and hasattr(optimizer, 'update_layout'):
+        print('Warmuping...')
+        optimizer.update_layout(memory_stats_collector.warmup_memstats)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
