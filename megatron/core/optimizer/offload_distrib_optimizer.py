@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import numpy as np
 import torch
 
@@ -554,7 +567,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
     def update_layout(
             self, 
             mem_stats: MemStats = None,
-            threshold: int = 1024**3
+            threshold: int = 1536 * 1024 ** 2
         ):
         if mem_stats is None:
             return
@@ -565,8 +578,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         chunk_mem = self.chunk_manager.total_mem['cuda']
         non_model_data = mem_stats.max_non_model_data('cuda')
 
-        available_space = torch.cuda.mem_get_info()[-1] - non_model_data - model_data - threshold
-
+        available_space = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() \
+            - model_data - non_model_data - threshold
 
         # if available sapce < 0, move some chunk to CPU
         if available_space < 0:
@@ -574,7 +587,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 for chunk in chunk_group:
                     if chunk.device_type == 'cpu':
                         continue
-                    released_mem = chunk.memory_usage['cuda']
+                    released_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
                     self.chunk_manager.move_chunk(chunk, 'cpu', async_move=False)
                     available_space += released_mem
                     if available_space >= 0:
@@ -589,7 +602,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 for chunk in chunk_group:
                     if chunk.device_type == 'cuda':
                         continue
-                    required_mem = chunk.memory_usage['cpu']
+                    required_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
                     if required_mem < available_space:
                         chunk_to_be_moved = chunk
                         break
@@ -598,15 +611,18 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             if chunk_to_be_moved is None:
                 break
             self.chunk_manager.move_chunk(chunk_to_be_moved, torch.cuda.current_device(), async_move=False)
+            available_space -= required_mem
         
         new_chunk_mem = self.chunk_manager.total_mem['cuda']
         new_model_data = new_chunk_mem - chunk_mem + model_data
         overall_allocated = new_model_data + non_model_data # NOTE: should always less than physical mem
-        ratio = self.chunk_manager.total_mem['cpu'] / sum(self.chunk_manager.total_mem.values())
+        ratios = self.chunk_manager.get_offload_ratio()
+        
         
         print(f'rank: {get_rank()} Model-Data: {model_data} Max Overall: {mem_stats.max_overall_cuda} \n'
               f'New Model-Data: {new_model_data} Assumed Max Usage: {overall_allocated}\n'
-              f'Max non-model data: {non_model_data} Offload Ratio: {ratio}\n')
+              f'Max non-model data: {non_model_data} Chunk Offload Ratio: {ratios["Chunk Offload Ratio"]}%\n'
+              f'Tensor Offload Ratio: {ratios["Tensor Offload Ratio"]}%\n')
 
     @torch.no_grad()
     def step(self, mem_stats = None):

@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from collections import deque, defaultdict
 from typing import Deque, Dict, Iterable, Optional, Set, Tuple, List
 import numpy as np
@@ -44,7 +57,7 @@ class ChunkManager:
         self.tensor_grad_map: Dict[Chunk, Dict[torch.Tensor, torch.Tensor]] = defaultdict(dict)
 
         # for optimizer state
-        self.paired_chunk_map: Dict[torch.Tensor, List[Chunk]] = defaultdict(list)
+        self.paired_chunk_map: Dict[Chunk, List[Chunk]] = defaultdict(list)
         
         self.pin_memory = pin_memory
 
@@ -97,49 +110,6 @@ class ChunkManager:
             self.tensor_chunk_map[tensor] = chunk_group[-1]
             return tensor
 
-    def __find_best_chunk_and_alloc(
-            self, 
-            tensor_size: torch.Tensor,
-            dtype: torch.dtype,
-            group_name: str,
-            pin_memory: bool = None
-        ) -> torch.Tensor:
-            # to make sure all tensor in the group have the same dtype
-            group_name = group_name + '_' + str(dtype)
-            chunk_group = self.__get_chunk_group(group_name)
-            chunk_size = self.chunk_size
-            # NOTE: Next-Fit
-            try:
-                # append the tensor to the last chunk
-                tensor = chunk_group[-1].alloc_tensor(tensor_size)
-            except (IndexError, ChunkFullError):
-                if pin_memory is None:
-                    pin_memory = self.pin_memory
-                # the except statement will be triggered when there is no chunk or
-                # the last chunk in the chunk group is full
-                # this will create a new chunk and allocate this chunk to its corresponding process
-                if chunk_group:
-                    # the chunk group is not empty
-                    # close the last chunk
-                    self.__close_one_chunk(chunk_group[-1])
-
-                if tensor_size.numel() > chunk_size:
-                    chunk_size = tensor_size.numel()
-
-                chunk = Chunk(
-                    chunk_size=chunk_size,
-                    init_device=self.device,
-                    dtype=dtype,
-                    pin_memory=pin_memory,
-                )
-
-                chunk_group.append(chunk)
-                tensor = chunk.alloc_tensor(tensor_size)
-                self.__add_memory_usage(chunk.memory_usage)
-            
-            self.tensor_chunk_map[tensor] = chunk_group[-1]
-            return tensor
-
     def register_tensor(
         self,
         tensor: torch.Tensor,
@@ -164,33 +134,6 @@ class ChunkManager:
 
         self.__find_best_chunk_and_append(
             tensor,
-            group_name,
-            pin_memory
-        )
-
-    def alloc_tensor(
-        self,
-        tensor_size: torch.Size,
-        dtype: torch.dtype,
-        group_type: str,
-        pin_memory: bool = True,
-    ) -> torch.Tensor:
-        """
-        Alloc a tensor to the chunk manager.
-        Then, the tensor should be accessed by `get_chunks`.
-
-        Args:
-            tensor: the tensor appended to the chunk
-            group_type: the annotation of the group, e.g., data type. The data type in the
-                group should be same.
-            pin_memory: whether the chunk is pinned in the cpu memory
-        """
-        rank = get_rank()
-        group_name = "{}_{}".format(group_type, rank)
-
-        return self.__find_best_chunk_and_alloc(
-            tensor_size,
-            dtype,
             group_name,
             pin_memory
         )
@@ -243,29 +186,6 @@ class ChunkManager:
             self.accessed_chunks.add(chunk)
         else:
             self.accessed_chunks.remove(chunk)
-
-    def get_chunk(self, tensor: torch.Tensor) -> Chunk:
-        """
-        Return the chunk owning the tensor.
-
-        Args:
-            tensor (torch.Tensor): a torch tensor object
-        """
-        return self.tensor_chunk_map[tensor]
-
-    def get_chunks(self, tensors: Iterable[torch.Tensor]) -> Tuple[Chunk, ...]:
-        """
-        Get all chunks owning the input tensors.
-
-        Args:
-            tensors (Iterable[torch.Tensor]): the tensors used to look for chunks
-        """
-        chunks = []
-        for tensor in tensors:
-            chunk = self.get_chunk(tensor)
-            if chunk not in chunks:
-                chunks.append(chunk)
-        return tuple(chunks)
 
     def create_grads(self):
         for group_name, chunk_group in self.chunk_groups.items():
@@ -390,8 +310,39 @@ class ChunkManager:
 
         return tensor_map
 
+    def get_offload_ratio(self):
+        n_param_cpu = [0, 0]
+        n_param_total = [0, 0]
+        for chunk_group in self.chunk_groups.values():
+            for chunk in chunk_group:
+                n_param_total[0] += chunk.chunk_mem
+                n_param_total[1] += chunk.get_valid_length() * chunk.dtype.itemsize
+                if chunk.device_type == 'cpu':
+                    n_param_cpu[0] += chunk.chunk_mem
+                    n_param_cpu[1] += chunk.get_valid_length() * chunk.dtype.itemsize
+                
+        return {
+            'Chunk Offload Ratio': n_param_cpu[0] / (n_param_total[0] + 1e-6) * 100,
+            'Tensor Offload Ratio': n_param_cpu[1] / (n_param_total[1] + 1e-6) * 100,
+        }
+
+    def calc_size_in_device(self, chunk: Chunk, device_type: str):
+        """
+        Given a chunk, get the total memory size it required in the target device
+        """
+        total = 0
+        numel = chunk.chunk_size
+        total += numel * chunk.dtype.itemsize
+        if self.__alloc_cuda_grad and device_type =='cuda':
+            total += numel * 4
+        
+        for pair_chunk in self.paired_chunk_map[chunk]:
+            total += pair_chunk.chunk_mem
+
+        return total
+
 def get_rank():
-    if torch.distributed.is_initialized():
+    if not torch.distributed.is_initialized():
         return 0
     return torch.distributed.get_rank()
 
