@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import numpy as np
 import torch
 
@@ -13,6 +26,8 @@ from .grad_scaler import MegatronGradScaler
 from ..distributed import ParamAndGradBuffer
 from .optimizer import _zero_grad_group_helper
 from .chunk import ChunkManager
+from megatron.training.memory_tracer import MemStats
+from .chunk.manager import get_rank
 
 __all__ = ['OffloadDistributedOptimizer']
 
@@ -194,10 +209,15 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             data_parallel_group: torch.distributed.ProcessGroup,
             data_parallel_group_gloo: torch.distributed.ProcessGroup,
             data_parallel_group_idx: int,
-            cpu_offload_fraction: float = 0.5,
         ):
-        self.cpu_offload_fraction = cpu_offload_fraction
-        assert 0 <= cpu_offload_fraction <= 1, "Offload fraction should be in [0, 1] !"
+
+        assert config.auto_offload_threshold % (1024**2) == 0 and config.auto_offload_threshold > 0, \
+            "auto offload threshold should be divided by 2**20"
+        assert 0 <= config.cpu_offload_fraction <= 1, "Offload fraction should be in [0, 1] !"
+        assert config.cpu_offload_policy in ['static', 'auto'], "Only support static or auto placement policy!"
+        self.cpu_offload_fraction = config.cpu_offload_fraction
+        self.auto_offload_threshold: int = config.auto_offload_threshold
+        self.policy = config.cpu_offload_policy
 
         assert isinstance(
             optimizer, CPUAdam
@@ -221,7 +241,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     assert buffer.grad_dtype == self.grad_dtype_in_buffer, "Currently only support consistent grad dtype!"
                 self.grad_dtype_in_buffer = buffer.grad_dtype
             
-
         self.chunk_manager = ChunkManager(
             chunk_size=config.cpu_offload_chunk_size \
                 if config.cpu_offload_chunk_size > 0 else ChunkManager.find_best_chunk_size(
@@ -256,23 +275,42 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-        # NOTE: select partial chunks to GPU
-        total_memory = self.chunk_manager.total_mem['cpu']
-        budget = round((1 - cpu_offload_fraction) * total_memory)
-        if budget > 0:
-            for _, chunks in self.chunk_manager.chunk_groups.items():
-                for chunk in chunks:
-                    self.chunk_manager.move_chunk(chunk, torch.cuda.current_device(), True)
-                    if self.chunk_manager.total_mem['cuda'] >= budget:
-                        break
-                if self.chunk_manager.total_mem['cuda'] >= budget:
-                    break            
-
         # NOTE: alloc grad buffer for each parameter
-        self.chunk_manager.create_grad()
+        self.chunk_manager.create_grads()
 
-        print('After initialization, parameter chunks use mem: ', self.chunk_manager.total_mem)
+        # NOTE: also alloc Adam states for each parameter
+        exp_avg = self.chunk_manager.alloc_paired_tensors(torch.float32)
+        exp_avg_sq = self.chunk_manager.alloc_paired_tensors(torch.float32)
         
+        for t, chunk_list in self.chunk_manager.paired_chunk_map.items():
+            assert len(chunk_list) == 2
+
+        for group in self.optimizer.param_groups:
+            for _, p in enumerate(group["params"]):
+                state = self.state[p]
+                assert len(state) == 0
+                state["step"] = 0
+                # gradient momentums
+                state["exp_avg"] = exp_avg[p]
+                # gradient variances
+                state["exp_avg_sq"] = exp_avg_sq[p]
+                self.optimizer._post_state_init(p)               
+
+        if self.policy == 'static':
+            # NOTE: select partial chunks to GPU
+            total_memory = self.chunk_manager.total_mem['cpu']
+            budget = round((1 - self.cpu_offload_fraction) * total_memory)
+            if budget > 0:
+                for _, chunks in self.chunk_manager.chunk_groups.items():
+                    for chunk in chunks:
+                        self.chunk_manager.move_chunk(chunk, torch.cuda.current_device(), True)
+                        if self.chunk_manager.total_mem['cuda'] >= budget:
+                            break
+                    if self.chunk_manager.total_mem['cuda'] >= budget:
+                        break         
+        # Total: (2 + 4 + 4) = 10M or (2 + 4 + 4 + 4) = 14M [if an extra fp32 grad chunk is required]
+        print('After initialization, parameter chunks use mem: ', self.chunk_manager.total_mem)
+
     def zero_grad(self, set_to_none=True):
         """
         Zeroes grads for the model related parameters, i.e., model_float16_groups
@@ -528,8 +566,70 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
         return self.update_successful
 
+    def update_layout(
+            self, 
+            mem_stats: MemStats = None,
+            threshold: int = None
+        ):
+        if mem_stats is None:
+            return
+        if threshold is None:
+            threshold = self.auto_offload_threshold
+        # NOTE: assume in optimizer.step(), we need less non-model data 
+        # than forward-backward step, therefore make 
+        # [chunk mem in CUDA] + threshold <= available space
+        model_data = mem_stats._prev_md_cuda
+        chunk_mem = self.chunk_manager.total_mem['cuda']
+        non_model_data = mem_stats.max_non_model_data('cuda')
+
+        current_usage = torch.cuda.memory_reserved() - model_data - non_model_data
+        available_space = torch.cuda.mem_get_info()[0] + current_usage - threshold
+
+        # if available sapce < 0, move some chunk to CPU
+        if available_space < 0:
+            for _, chunk_group in self.chunk_manager.chunk_groups.items():
+                for chunk in chunk_group:
+                    if chunk.device_type == 'cpu':
+                        continue
+                    released_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
+                    self.chunk_manager.move_chunk(chunk, 'cpu', async_move=False)
+                    available_space += released_mem
+                    if available_space >= 0:
+                        break
+                if available_space >= 0:
+                    break
+  
+        # otherwise try to move chunk to CUDA without violating memory constraints
+        while True:
+            chunk_to_be_moved = None
+            for _, chunk_group in self.chunk_manager.chunk_groups.items():
+                for chunk in chunk_group:
+                    if chunk.device_type == 'cuda':
+                        continue
+                    required_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
+                    if required_mem < available_space:
+                        chunk_to_be_moved = chunk
+                        break
+                if chunk_to_be_moved is not None:
+                    break
+            if chunk_to_be_moved is None:
+                break
+            self.chunk_manager.move_chunk(chunk_to_be_moved, torch.cuda.current_device(), async_move=False)
+            available_space -= required_mem
+        
+        # new_chunk_mem = self.chunk_manager.total_mem['cuda']
+        # new_model_data = new_chunk_mem - chunk_mem + model_data
+        # overall_allocated = new_model_data + non_model_data # NOTE: should always less than physical mem
+        # ratios = self.chunk_manager.get_offload_ratio()
+        # print(f'rank: {get_rank()} Model-Data: {model_data} Max Overall: {mem_stats.max_overall_cuda} \n'
+        #       f'New Model-Data: {new_model_data} Assumed Max Usage: {overall_allocated}\n'
+        #       f'Max non-model data: {non_model_data} Chunk Offload Ratio: {ratios["Chunk Offload Ratio"]}%\n'
+        #       f'Tensor Offload Ratio: {ratios["Tensor Offload Ratio"]}%\n')
+
     @torch.no_grad()
-    def step(self):
+    def step(self, mem_stats = None):
+        if self.policy == 'auto':
+            self.update_layout(mem_stats)
         success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
         if success:
             success = self.step_with_ready_grads()

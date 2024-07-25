@@ -107,7 +107,10 @@ class OptimizerConfig:
     """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
 
     cpu_offload_chunk_size: int = 0
-    """Chunk Size used by CPU offload Chunk Manager, automatically search if value is 0 (default)"""
+    """Chunk Size used by CPU offload Chunk Manager (bytes), automatically search if value is 0 (default)"""
+
+    auto_offload_threshold: int = 2048 * 1024 ** 2
+    """threshold for auto optimizer offload (bytes) should be larger if OOM"""
 
     ################
     # Miscellaneous

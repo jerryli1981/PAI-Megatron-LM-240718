@@ -37,7 +37,6 @@ class MemStats(object):
     def calc_max_cuda_non_model_data(self):
         if self._prev_overall_cuda != -1 and self._prev_md_cuda != -1:
             max_cuda_non_model_data = self._prev_overall_cuda - self._prev_md_cuda
-            self._step_nmd_dict[self._preop_step - 1] = max_cuda_non_model_data
             # compatibility of the old version.
             self._non_model_data_cuda_list.append(max_cuda_non_model_data)
 
@@ -51,44 +50,6 @@ class MemStats(object):
     @property
     def max_overall_cuda(self):
         return self._max_overall_cuda
-
-    def increase_preop_step(self, param_list: List[torch.nn.Parameter]):
-        """
-        the time step is increased. param list is used between current and the next
-        time step.
-
-        Args:
-            param_list (List[torch.nn.Parameter]): a list of torch parameters.
-        """
-        for p in param_list:
-            if p not in self._param_step_dict:
-                self._param_step_dict[p] = [self._preop_step]
-            else:
-                self._param_step_dict[p].append(self._preop_step)
-            self._param_runtime_order.append(p)
-        self._step_param_dict[self._preop_step] = param_list
-        self._preop_step += 1
-
-    def param_used_step(self, param: torch.nn.Parameter) -> Optional[List[int]]:
-        """param_used_step
-        get the timestep list using the param
-
-        Args:
-            param (torch.nn.Parameter): a torch param
-
-        Returns:
-            Optional[List[int]]: a list of int indicates the time step of preop hook.
-        """
-        if param not in self._param_step_dict:
-            return None
-        else:
-            return self._param_step_dict[param]
-
-    def param_order(self):
-        if self._param_runtime_order.is_empty():
-            raise RuntimeError
-        else:
-            return self._param_runtime_order
 
     def non_model_data_list(self, device_type: str) -> List[int]:
         if device_type == "cuda":

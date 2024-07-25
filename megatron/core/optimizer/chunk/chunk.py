@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba PAI, ColossalAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -13,20 +26,6 @@ class TensorInfo:
 
 class ChunkFullError(Exception):
     pass
-
-
-def is_storage_empty(tensor: torch.Tensor) -> bool:
-    return tensor.storage().size() == 0
-
-
-def free_storage(tensor: torch.Tensor) -> None:
-    if not is_storage_empty(tensor):
-        tensor.storage().resize_(0)
-
-
-def alloc_storage(tensor: torch.Tensor) -> None:
-    if is_storage_empty(tensor):
-        tensor.storage().resize_(tensor.numel())
 
 def _to_device_obj(maybe_device: Union[int, str, torch.device]):
     if isinstance(maybe_device, int):
@@ -234,14 +233,16 @@ class Chunk:
         output.append("\tmemory usage: cuda {}, cpu {}\n".format(memory_info["cuda"], memory_info["cpu"]))
         return "".join(output)
 
-    def clone(self) -> 'Chunk':
+    def clone(self, dtype=None) -> 'Chunk':
         """
             Return a clone of self, each tensor in the clone is also a clone of raw tensor
         """
+        if dtype is None:
+            dtype = self.dtype
 
         cloned = Chunk(
             self.chunk_size,
-            self.dtype,
+            dtype,
             self._target_device,
             self.pin_memory,
             self.release_cpu_mem_in_cuda_chunk

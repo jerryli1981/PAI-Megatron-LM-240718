@@ -1,4 +1,17 @@
-from collections import deque
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from collections import deque, defaultdict
 from typing import Deque, Dict, Iterable, Optional, Set, Tuple, List
 import numpy as np
 import torch
@@ -34,9 +47,17 @@ class ChunkManager:
         # NOTE: only used for chunk init, NOT REPRESENT TENSOR DEVICE!
         self.device = init_device or _to_device_obj(torch.cuda.current_device())
         self.chunk_groups: Dict[str, Deque[Chunk]] = dict()
-        self.grad_groups: Dict[str, Deque[Chunk]] = dict()
+        
+        self.param_to_grad_chunk_map: Dict[Chunk, Chunk] = dict()
+
+        # tensor to its corresponding chunk
         self.tensor_chunk_map: Dict[torch.Tensor, Chunk] = dict()
-        self.tensor_grad_map: Dict[torch.Tensor, torch.Tensor] = dict()
+
+        # NOTE: (param chunk -> (param tensor -> param grad))
+        self.tensor_grad_map: Dict[Chunk, Dict[torch.Tensor, torch.Tensor]] = defaultdict(dict)
+
+        # for optimizer state
+        self.paired_chunk_map: Dict[Chunk, List[Chunk]] = defaultdict(list)
         
         self.pin_memory = pin_memory
 
@@ -53,7 +74,8 @@ class ChunkManager:
             group_name: str,
             pin_memory: bool = None
         ):
-
+            # to make sure all tensor in the group have the same dtype
+            group_name = group_name + '_' + str(tensor.dtype)
             chunk_group = self.__get_chunk_group(group_name)
             chunk_size = self.chunk_size
             # NOTE: Next-Fit
@@ -85,14 +107,15 @@ class ChunkManager:
                 chunk.append_tensor(tensor)
                 self.__add_memory_usage(chunk.memory_usage)
 
-            return chunk_group[-1]
+            self.tensor_chunk_map[tensor] = chunk_group[-1]
+            return tensor
 
     def register_tensor(
         self,
         tensor: torch.Tensor,
         group_type: str,
         pin_memory: bool = True,
-    ) -> None:
+    ) -> torch.Tensor:
         """
         Register a tensor to the chunk manager.
         Then, the tensor should be accessed by `get_chunks`.
@@ -122,54 +145,69 @@ class ChunkManager:
 
     def move_chunk(self, chunk: Chunk, device: torch.device, async_move=False) -> None:
         """Move the shard of the chunk to the target device."""
+
+        device = _to_device_obj(device)
+        # NOTE: if a param chunk is moved to cuda, the cpu grad chunk may be dropped
         self.__sub_memory_usage(chunk.memory_usage)
         chunk.reset_device(device, async_move=async_move)
         self.__add_memory_usage(chunk.memory_usage)
+
+        # NOTE: drop or create grad chunk
+        # __alloc_cuda_grad:
+        # False, cpu -> cuda [maybe release cpu chunk], cuda -> cpu [maybe create chunk]
+        # True, cpu -> cuda [move chunk], cuda -> cpu [move chunk]
+
+        # TODO: allow recycle grad chunk to avoid repeated allocation.
+        if self.__alloc_cuda_grad:
+            grad_chunk = self.param_to_grad_chunk_map[chunk]
+            self.__sub_memory_usage(grad_chunk.memory_usage)
+            self.param_to_grad_chunk_map[grad_chunk].reset_device(device, async_move=async_move)
+            self.__add_memory_usage(grad_chunk.memory_usage)
+        elif device.type == 'cuda':
+            if chunk in self.param_to_grad_chunk_map:                
+                grad_chunk = self.param_to_grad_chunk_map.pop(chunk)
+                assert grad_chunk.device_type == 'cpu'
+                self.tensor_grad_map.pop(chunk)
+                self.__sub_memory_usage(grad_chunk.memory_usage)
+            # otherwise try to move a cuda grad chunk to cuda, do nothing
+        else:
+            if chunk not in self.param_to_grad_chunk_map:
+                self.create_grad(chunk)
+            # otherwise try to move a cpu grad chunk to cpu, do nothing
+
+        # NOTE: move optimizer state chunks
+        for paired_chunk in self.paired_chunk_map[chunk]:
+            self.__sub_memory_usage(paired_chunk.memory_usage)
+            paired_chunk.reset_device(device, async_move=async_move)
+            self.__add_memory_usage(paired_chunk.memory_usage)
+
         device = _to_device_obj(device)
         if device.type == 'cuda':
             self.accessed_chunks.add(chunk)
+        else:
+            self.accessed_chunks.remove(chunk)
 
-    def get_chunk(self, tensor: torch.Tensor) -> Chunk:
-        """
-        Return the chunk owning the tensor.
-
-        Args:
-            tensor (torch.Tensor): a torch tensor object
-        """
-        return self.tensor_chunk_map[tensor]
-
-    def get_chunks(self, tensors: Iterable[torch.Tensor]) -> Tuple[Chunk, ...]:
-        """
-        Get all chunks owning the input tensors.
-
-        Args:
-            tensors (Iterable[torch.Tensor]): the tensors used to look for chunks
-        """
-        chunks = []
-        for tensor in tensors:
-            chunk = self.get_chunk(tensor)
-            if chunk not in chunks:
-                chunks.append(chunk)
-        return tuple(chunks)
-
-    def create_grad(self):
+    def create_grads(self):
         for group_name, chunk_group in self.chunk_groups.items():
-            self.grad_groups[group_name] = deque()
+            if 'param' not in group_name:
+                continue
             for chunk in chunk_group:
                 if chunk.device_type == 'cpu' or self.__alloc_cuda_grad:
-                    grad_chunk = chunk.clone()
-                    self.__add_memory_usage(grad_chunk.memory_usage)
-                    self.grad_groups[group_name].append(grad_chunk)
-                    
-                    for param, grad in zip(chunk.get_tensors(), grad_chunk.get_tensors()):
-                        self.tensor_chunk_map[param] = grad
+                    self.create_grad(chunk)
+                                
+    def create_grad(self, param_chunk: Chunk):
+        grad_chunk = param_chunk.clone()
+        self.__add_memory_usage(grad_chunk.memory_usage)
+        self.param_to_grad_chunk_map[param_chunk] = grad_chunk
         
-        self.attach_grad()
-    
+        for param, grad in zip(param_chunk.get_tensors(), grad_chunk.get_tensors()):
+            self.tensor_grad_map[param_chunk][param] = grad
+
     def attach_grad(self):
-        for param, grad in self.tensor_chunk_map.items():
-            assert param.shape == grad.shape
-            param.grad = grad
+        for param_grad_map in self.tensor_grad_map.values():
+            for param, grad in param_grad_map.items():
+                assert param.shape == grad.shape
+                param.grad = grad
 
     def __repr__(self) -> str:
         msg = [
@@ -252,9 +290,59 @@ class ChunkManager:
         
         return results[0][0]
 
+    def alloc_paired_tensors(
+        self,
+        dtype: torch.dtype,
+    ) -> Dict[torch.Tensor, torch.Tensor]:
+        """
+            Alloc paired tensors for each parameter in self.chunk_groups (with same device)
+
+        """
+        tensor_map = {}
+        # NOTE: freeze chunk group for iteration
+        for _, chunk_group in list(self.chunk_groups.items()):
+            for chunk in chunk_group:
+                paired = chunk.clone(dtype)
+                self.__add_memory_usage(paired.memory_usage)
+                for tensor, p in zip(chunk.get_tensors(), paired.get_tensors()):
+                    tensor_map[tensor] = p
+                self.paired_chunk_map[chunk].append(paired)
+
+        return tensor_map
+
+    def get_offload_ratio(self):
+        n_param_cpu = [0, 0]
+        n_param_total = [0, 0]
+        for chunk_group in self.chunk_groups.values():
+            for chunk in chunk_group:
+                n_param_total[0] += chunk.chunk_mem
+                n_param_total[1] += chunk.get_valid_length() * chunk.dtype.itemsize
+                if chunk.device_type == 'cpu':
+                    n_param_cpu[0] += chunk.chunk_mem
+                    n_param_cpu[1] += chunk.get_valid_length() * chunk.dtype.itemsize
+                
+        return {
+            'Chunk Offload Ratio': n_param_cpu[0] / (n_param_total[0] + 1e-6) * 100,
+            'Tensor Offload Ratio': n_param_cpu[1] / (n_param_total[1] + 1e-6) * 100,
+        }
+
+    def calc_size_in_device(self, chunk: Chunk, device_type: str):
+        """
+        Given a chunk, get the total memory size it required in the target device
+        """
+        total = 0
+        numel = chunk.chunk_size
+        total += numel * chunk.dtype.itemsize
+        if self.__alloc_cuda_grad and device_type =='cuda':
+            total += numel * 4
+        
+        for pair_chunk in self.paired_chunk_map[chunk]:
+            total += pair_chunk.chunk_mem
+
+        return total
 
 def get_rank():
-    if torch.distributed.is_initialized():
+    if not torch.distributed.is_initialized():
         return 0
     return torch.distributed.get_rank()
 

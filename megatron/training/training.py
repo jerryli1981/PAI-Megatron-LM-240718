@@ -578,10 +578,15 @@ def setup_model_and_optimizer(model_provider_func,
 
     return model, optimizer, opt_param_scheduler
 
+from megatron.core.distributed import ParamAndGradBuffer
+def __get_param_buffer_size(buffer: ParamAndGradBuffer) -> int:
+    grad_type = buffer.grad_dtype
+    param_dtype = buffer.param_dtype
+    return (grad_type.itemsize + param_dtype.itemsize) * buffer.numel
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config, memory_stats_collector):
+               model, optimizer, opt_param_scheduler, config, memory_stats_collector : MemStatsCollector):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -589,6 +594,12 @@ def train_step(forward_step_func, data_iterator,
     # Set grad to zero.
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
+    model_buffer_param = sum(__get_param_buffer_size(buffer) for model_chunk in model for buffer in model_chunk.buffers)
+    memory_stats_collector.record_model_data_volume(
+        model_buffer_param,
+        optimizer.chunk_manager.total_mem['cuda'] if hasattr(optimizer, 'chunk_manager') else 0
+    )
+
     optimizer.zero_grad()
 
     # Forward pass.
@@ -611,13 +622,26 @@ def train_step(forward_step_func, data_iterator,
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+    memory_stats_collector.sample_overall_data()
+
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if hasattr(optimizer, 'chunk_manager'):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(memory_stats_collector._memstats)
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+    memory_stats_collector.record_model_data_volume(
+        model_buffer_param,
+        optimizer.chunk_manager.total_mem['cuda'] if hasattr(optimizer, 'chunk_manager') else 0
+    )
 
-    memory_stats_collector.finish_collection()
+    memory_stats_collector.sample_overall_data()
+    may_evict_tensor = memory_stats_collector.on_iter_end()
+    if optimizer.policy =='auto' and may_evict_tensor and hasattr(optimizer, 'update_layout'):
+        print('Warmuping...')
+        optimizer.update_layout(memory_stats_collector.warmup_memstats)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
