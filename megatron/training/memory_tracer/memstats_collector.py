@@ -1,3 +1,16 @@
+# Copyright (c) 2024 Alibaba PAI, ColossalAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import time
 from typing import Optional
 
@@ -30,8 +43,6 @@ class MemStatsCollector:
         self.warmup_memstats = MemStats()
         self.warmup_memstats._non_model_data_cuda_list.append(0)
 
-        
-
     @property
     def sampling_time(self):
         return [t - self._sampling_time[0] for t in self._sampling_time]
@@ -51,10 +62,10 @@ class MemStatsCollector:
 
     # deprecated
     def record_model_data_volume(
-            self, 
-            current_model_data_volume: int,
-            current_optimizer_data_volume: int,
-        ) -> None:
+        self,
+        current_model_data_volume: int,
+        current_optimizer_data_volume: int,
+    ) -> None:
         """
         Sampling model data statistics.
         """
@@ -86,19 +97,17 @@ class MemStatsCollector:
 
     def on_iter_end(self) -> bool:
         """
-            During warmup, the non-model data is regarded as the amount of non-model data in each step.
-            This strategy is to avoid OOM in the next iteration.
+        During warmup, the non-model data is regarded as the amount of non-model data in each step.
+        This strategy is to avoid OOM in the next iteration.
 
-            The warmup ends only when the current max non-model data is no more than amount of last iteration.
+        The warmup ends only when the current max non-model data is no more than amount of last iteration.
         """
         in_warmup = self._warmup
         nmd_cur_iter = self._memstats.max_non_model_data('cuda')
         nmd_warmup = self.warmup_memstats.max_non_model_data('cuda')
         self._warmup = nmd_cur_iter > nmd_warmup
         if self._warmup:
-            self.warmup_memstats.record_max_cuda_model_data(
-                self._memstats._prev_md_cuda
-            )
+            self.warmup_memstats.record_max_cuda_model_data(self._memstats._prev_md_cuda)
             self.warmup_memstats.non_model_data_list('cuda').append(
                 sum(self._memstats.non_model_data_list('cuda'))
             )
