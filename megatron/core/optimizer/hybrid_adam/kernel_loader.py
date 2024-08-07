@@ -11,20 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import warnings
-from typing import List
 import hashlib
-import os
-from abc import ABC, abstractmethod
-from typing import Callable, Union
-from pathlib import Path
 import importlib
-import time
-from torch.utils.cpp_extension import CppExtension
-from torch.utils.cpp_extension import CUDA_HOME, CUDAExtension
+import os
 import platform
+import time
+import warnings
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Callable, List, Union
+
+from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension
 
 from ._utils import *
+
 
 class _Extension(ABC):
     def __init__(self, name: str, support_aot: bool, support_jit: bool, priority: int = 1):
@@ -46,34 +46,35 @@ class _Extension(ABC):
         return self._support_jit
 
     @staticmethod
-    def get_jit_extension_folder_path():
+    def get_jit_extension_folder_path(name):
         """
         Kernels which are compiled during runtime will be stored in the same cache folder for reuse.
-        The folder is in the path ~/.cache/colossalai/torch_extensions/<cache-folder>.
+        The folder is in the path ~/.cache/megatron_patch/torch_extensions/<cache-folder>.
         The name of the <cache-folder> follows a common format:
             torch<torch_version_major>.<torch_version_minor>_<device_name><device_version>-<hash>
 
-        The <hash> suffix is the hash value of the path of the `colossalai` file.
+        The <hash> suffix is the hash value of the path of the `megatron_patch` file.
         """
+        import megatron_patch
         import torch
+        from torch.version import cuda
 
-        import colossalai
-        from colossalai.accelerator import get_accelerator
+        assert name in ["cpu", "cuda"], f"the argument `name` should be `cpu` or `cuda`!"
 
         # get torch version
         torch_version_major = torch.__version__.split(".")[0]
         torch_version_minor = torch.__version__.split(".")[1]
 
         # get device version
-        device_name = get_accelerator().name
-        device_version = get_accelerator().get_version()
+        device_name = name
+        device_version = cuda if name == 'cuda' else ''
 
         # use colossalai's file path as hash
-        hash_suffix = hashlib.sha256(colossalai.__file__.encode()).hexdigest()
+        hash_suffix = hashlib.sha256(megatron_patch.__file__.encode()).hexdigest()
 
         # concat
         home_directory = os.path.expanduser("~")
-        extension_directory = f".cache/colossalai/torch_extensions/torch{torch_version_major}.{torch_version_minor}_{device_name}-{device_version}-{hash_suffix}"
+        extension_directory = f".cache/megatron_patch/torch_extensions/torch{torch_version_major}.{torch_version_minor}_{device_name}-{device_version}-{hash_suffix}"
         cache_directory = os.path.join(home_directory, extension_directory)
         return cache_directory
 
@@ -100,6 +101,7 @@ class _Extension(ABC):
     @abstractmethod
     def load(self) -> Callable:
         pass
+
 
 __all__ = [
     "CPUAdamLoader",
@@ -157,7 +159,7 @@ class _CppExtension(_Extension):
         return importlib.import_module(self.prebuilt_import_path)
 
     def build_aot(self) -> "CppExtension":
-        
+
         return CppExtension(
             name=self.prebuilt_import_path,
             sources=self.strip_empty_entries(self.sources_files()),
@@ -168,7 +170,7 @@ class _CppExtension(_Extension):
     def build_jit(self) -> None:
         from torch.utils.cpp_extension import load
 
-        build_directory = _Extension.get_jit_extension_folder_path()
+        build_directory = _Extension.get_jit_extension_folder_path("cpu")
         build_directory = Path(build_directory)
         build_directory.mkdir(parents=True, exist_ok=True)
 
@@ -232,6 +234,7 @@ class _CppExtension(_Extension):
 
         return op_kernel
 
+
 class _CudaExtension(_CppExtension):
     @abstractmethod
     def nvcc_flags(self) -> List[str]:
@@ -269,7 +272,9 @@ class _CudaExtension(_CppExtension):
         from torch.utils.cpp_extension import CUDA_HOME
 
         if CUDA_HOME is None:
-            raise RuntimeError("CUDA_HOME is None, please set CUDA_HOME to compile C++/CUDA kernels in ColossalAI.")
+            raise RuntimeError(
+                "CUDA_HOME is None, please set CUDA_HOME to compile C++/CUDA kernels in ColossalAI."
+            )
         cuda_include = os.path.join(CUDA_HOME, "include")
         return cuda_include
 
@@ -285,7 +290,7 @@ class _CudaExtension(_CppExtension):
         set_cuda_arch_list(CUDA_HOME)
 
         # get build dir
-        build_directory = _Extension.get_jit_extension_folder_path()
+        build_directory = _Extension.get_jit_extension_folder_path("cuda")
         build_directory = Path(build_directory)
         build_directory.mkdir(parents=True, exist_ok=True)
 
@@ -321,7 +326,6 @@ class _CudaExtension(_CppExtension):
         return op_kernel
 
     def build_aot(self) -> "CUDAExtension":
-        
 
         set_cuda_arch_list(CUDA_HOME)
         return CUDAExtension(
@@ -333,6 +337,7 @@ class _CudaExtension(_CppExtension):
                 "nvcc": self.strip_empty_entries(self.nvcc_flags()),
             },
         )
+
 
 class CpuAdamX86Extension(_CudaExtension):
     def __init__(self):
@@ -377,8 +382,14 @@ class CpuAdamX86Extension(_CudaExtension):
             "-U__CUDA_NO_HALF2_OPERATORS__",
             "-DTHRUST_IGNORE_CUB_VERSION_CHECK",
         ]
-        ret = ["-O3", "--use_fast_math"] + self.version_dependent_macros + extra_cuda_flags + super().nvcc_flags()
+        ret = (
+            ["-O3", "--use_fast_math"]
+            + self.version_dependent_macros
+            + extra_cuda_flags
+            + super().nvcc_flags()
+        )
         return append_nvcc_threads(ret)
+
 
 class CpuAdamArmExtension(_CppExtension):
     def __init__(self):
@@ -416,6 +427,30 @@ class CpuAdamArmExtension(_CppExtension):
 
     def nvcc_flags(self):
         return []
+
+
+class FusedOptimizerCudaExtension(_CudaExtension):
+    def __init__(self):
+        super().__init__(name="fused_optim_cuda")
+
+    def sources_files(self):
+        ret = [
+            self.csrc_abs_path(
+                "kernel/cuda/multi_tensor_adam_kernel.cu",
+            ),
+            self.csrc_abs_path("optimizer/optimizer.cpp"),
+        ]
+        return ret
+
+    def cxx_flags(self):
+        version_dependent_macros = ["-DVERSION_GE_1_1", "-DVERSION_GE_1_3", "-DVERSION_GE_1_5"]
+        return ["-O3"] + version_dependent_macros
+
+    def nvcc_flags(self):
+        extra_cuda_flags = ["-lineinfo"]
+        extra_cuda_flags.extend(get_cuda_cc_flag())
+        return ["-O3", "--use_fast_math"] + extra_cuda_flags + super().nvcc_flags()
+
 
 class KernelLoader:
     """
@@ -461,7 +496,9 @@ class KernelLoader:
                     ext.assert_compatible()
                     usable_exts.append(ext)
 
-        assert len(usable_exts) != 0, f"No usable kernel found for {self.__class__.__name__} on the current machine."
+        assert (
+            len(usable_exts) != 0
+        ), f"No usable kernel found for {self.__class__.__name__} on the current machine."
 
         if len(usable_exts) > 1:
             # if more than one usable kernel is found, we will try to load the kernel with the highest priority
@@ -471,6 +508,10 @@ class KernelLoader:
             )
         return usable_exts[0].load()
 
+
 class CPUAdamLoader(KernelLoader):
     REGISTRY = [CpuAdamX86Extension, CpuAdamArmExtension]
 
+
+class FusedOptimizerLoader(KernelLoader):
+    REGISTRY = [FusedOptimizerCudaExtension]

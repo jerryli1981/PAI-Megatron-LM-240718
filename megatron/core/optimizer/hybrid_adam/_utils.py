@@ -15,7 +15,7 @@ import warnings
 from typing import List
 import os
 import subprocess
-
+import re
 
 def check_cuda_availability():
     """
@@ -193,3 +193,26 @@ def append_nvcc_threads(nvcc_extra_args: List[str]) -> List[str]:
     if int(bare_metal_major) >= 11 and int(bare_metal_minor) >= 2:
         return nvcc_extra_args + ["--threads", "4"]
     return nvcc_extra_args
+
+def get_cuda_cc_flag() -> List[str]:
+    """
+    This function produces the cc flags for your GPU arch
+
+    Returns:
+        The CUDA cc flags for compilation.
+    """
+
+    # only import torch when needed
+    # this is to avoid importing torch when building on a machine without torch pre-installed
+    # one case is to build wheel for pypi release
+    import torch
+
+    cc_flag = []
+    max_arch = "".join(str(i) for i in torch.cuda.get_device_capability())
+    for arch in torch.cuda.get_arch_list():
+        res = re.search(r"sm_(\d+)", arch)
+        if res:
+            arch_cap = res[1]
+            if int(arch_cap) >= 60 and int(arch_cap) <= int(max_arch):
+                cc_flag.extend(["-gencode", f"arch=compute_{arch_cap},code={arch}"])
+    return cc_flag

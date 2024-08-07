@@ -15,9 +15,16 @@ from typing import Any, Optional
 
 import torch
 
-from colossalai.kernel.kernel_loader import FusedOptimizerLoader
-from colossalai.utils import get_current_device, multi_tensor_applier
+from .kernel_loader import FusedOptimizerLoader
 
+try:
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier
+except ImportError:
+    try:
+        from apex.multi_tensor_apply import multi_tensor_applier
+    except ImportError:
+        from megatron.core.utils import local_multi_tensor_applier
+        multi_tensor_applier = local_multi_tensor_applier
 from .cpu_adam import CPUAdam
 
 
@@ -100,7 +107,7 @@ class HybridAdam(CPUAdam):
         if torch.cuda.is_available():
             fused_optim = FusedOptimizerLoader().load()
             self.gpu_adam_op = fused_optim.multi_tensor_adam
-            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=torch.cuda.current_device())
 
     @torch.no_grad()
     def step(self, closure=None, div_scale: float = -1):
