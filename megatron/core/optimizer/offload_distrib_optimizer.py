@@ -15,31 +15,32 @@ import numpy as np
 import torch
 
 from typing import *
-from .optimizer import multi_tensor_scale_impl, multi_tensor_applier
-from .distrib_optimizer import DistributedOptimizer
-from .. import tensor_parallel
-from .clip_grads import get_grad_norm_fp32
-from ..transformer.module import param_is_not_shared
-from .hybrid_adam import CPUAdam
-from .optimizer_config import OptimizerConfig
-from .grad_scaler import MegatronGradScaler
-from ..distributed import ParamAndGradBuffer
-from .optimizer import _zero_grad_group_helper
-from .chunk import ChunkManager
 from megatron.training.memory_tracer import MemStats
+
+from .. import tensor_parallel
+from ..distributed import ParamAndGradBuffer
+from ..transformer.module import param_is_not_shared
+from .chunk import ChunkManager
 from .chunk.manager import get_rank
+from .clip_grads import get_grad_norm_fp32
+from .distrib_optimizer import DistributedOptimizer
+from .grad_scaler import MegatronGradScaler
+from .hybrid_adam import CPUAdam
+from .optimizer import (
+    _zero_grad_group_helper,
+    multi_tensor_applier,
+    multi_tensor_scale_impl,
+)
+from .optimizer_config import OptimizerConfig
 
 __all__ = ['OffloadDistributedOptimizer']
 
+
 class OffloadDistributedOptimizer(DistributedOptimizer):
 
-    def _build_model_and_main_param_groups(
-        self,
-        *args,
-        **kwargs
-    ):  
+    def _build_model_and_main_param_groups(self, *args, **kwargs):
         """
-            This function overrides DO._build_model_and_main_param_groups
+        This function overrides DO._build_model_and_main_param_groups
         """
         return None, None, None, None, None
 
@@ -90,7 +91,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             shard_float16_groups.append(shard_float16_params_this_group)
             shard_fp32_groups.append(shard_fp32_params_this_group)
 
-            # Hybrid FP32 copies of sharded parameters 
+            # Hybrid FP32 copies of sharded parameters
             shard_fp32_from_float16_groups.append(shard_fp32_from_float16_params_this_group)
             shard_fp32_from_float32_groups.append(shard_fp32_from_float32_params_this_group)
 
@@ -109,8 +110,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     ]
                     shard_main_param = shard_model_param.clone().float()
                     self.chunk_manager.register_tensor(
-                        shard_main_param,
-                        'shard_fp32_from_float16_params'
+                        shard_main_param, 'shard_fp32_from_float16_params'
                     )
 
                     tensor_parallel.copy_tensor_model_parallel_attributes(
@@ -136,10 +136,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
                     shard_main_param = shard_model_param.clone()
                     self.chunk_manager.register_tensor(
-                        shard_main_param.clone().float(),
-                        'shard_fp32_from_float16_params'
+                        shard_main_param.clone().float(), 'shard_fp32_from_float16_params'
                     )
-                    
+
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
@@ -174,8 +173,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             model_fp32_groups,
             shard_float16_groups,
             shard_fp32_groups,
-            shard_fp32_from_float16_groups, 
-            shard_fp32_from_float32_groups
+            shard_fp32_from_float16_groups,
+            shard_fp32_from_float32_groups,
         )
 
     def collect_shard_param_numel(
@@ -183,7 +182,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         gbuf_ranges: List[Dict],
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
-        ):
+    ):
 
         numels = np.zeros([sum(len(group_range["params"]) for group_range in opt_group_ranges)])
         ptr = 0
@@ -196,32 +195,37 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
                 numels[ptr] = param_range.end - param_range.start
                 ptr += 1
-        
-        return numels
-        
-    def __init__(
-            self,
-            optimizer: torch.optim.Optimizer,
-            config: OptimizerConfig,
-            grad_scaler: MegatronGradScaler,
-            init_state_fn: Optional[Callable],
-            per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
-            data_parallel_group: torch.distributed.ProcessGroup,
-            data_parallel_group_gloo: torch.distributed.ProcessGroup,
-            data_parallel_group_idx: int,
-        ):
 
-        assert config.auto_offload_threshold % (1024**2) == 0 and config.auto_offload_threshold > 0, \
-            "auto offload threshold should be divided by 2**20"
-        assert 0 <= config.cpu_offload_fraction <= 1, "Offload fraction should be in [0, 1] !"
-        assert config.cpu_offload_policy in ['static', 'auto'], "Only support static or auto placement policy!"
-        self.cpu_offload_fraction = config.cpu_offload_fraction
-        self.auto_offload_threshold: int = config.auto_offload_threshold
-        self.policy = config.cpu_offload_policy
+        return numels
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        config: OptimizerConfig,
+        grad_scaler: MegatronGradScaler,
+        init_state_fn: Optional[Callable],
+        per_model_buffers: Dict[int, List[ParamAndGradBuffer]],
+        data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_group_gloo: torch.distributed.ProcessGroup,
+        data_parallel_group_idx: int,
+    ):
+
+        assert (
+            config.optimizer_offload_auto_threshold % (1024**2) == 0
+            and config.optimizer_offload_auto_threshold > 0
+        ), "auto offload threshold should be divided by 2**20"
+        assert 0 <= config.optimizer_offload_fraction <= 1, "Offload fraction should be in [0, 1] !"
+        assert config.optimizer_offload_policy in [
+            'static',
+            'auto',
+        ], "Only support static or auto placement policy!"
+        self.optimizer_offload_fraction = config.optimizer_offload_fraction
+        self.optimizer_offload_auto_threshold: int = config.optimizer_offload_auto_threshold
+        self.policy = config.optimizer_offload_policy
 
         assert isinstance(
             optimizer, CPUAdam
-        ), "Only CPUAdam currently supported, due to checkpointing requirements."        
+        ), "Only CPUAdam currently supported, due to checkpointing requirements."
         super().__init__(
             optimizer,
             config,
@@ -230,7 +234,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             per_model_buffers,
             data_parallel_group,
             data_parallel_group_gloo,
-            data_parallel_group_idx
+            data_parallel_group_idx,
         )
 
         # In bf16 model training
@@ -238,21 +242,24 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         for _, buffers in per_model_buffers.items():
             for buffer in buffers:
                 if self.grad_dtype_in_buffer is not None:
-                    assert buffer.grad_dtype == self.grad_dtype_in_buffer, "Currently only support consistent grad dtype!"
+                    assert (
+                        buffer.grad_dtype == self.grad_dtype_in_buffer
+                    ), "Currently only support consistent grad dtype!"
                 self.grad_dtype_in_buffer = buffer.grad_dtype
-            
+
         self.chunk_manager = ChunkManager(
-            chunk_size=config.cpu_offload_chunk_size \
-                if config.cpu_offload_chunk_size > 0 else ChunkManager.find_best_chunk_size(
+            chunk_size=(
+                config.optimizer_offload_chunk_size
+                if config.optimizer_offload_chunk_size > 0
+                else ChunkManager.find_best_chunk_size(
                     self.collect_shard_param_numel(
-                        self.gbuf_ranges,
-                        self.model_param_gbuf_map,
-                        self.opt_group_ranges
+                        self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
                     ),
-                    512 # NOTE: search chunk size in [32MB, 544MB]
-                ),
+                    512,  # NOTE: search chunk size in [32MB, 544MB]
+                )
+            ),
             init_device='cpu',
-            is_fp32_grad=self.grad_dtype_in_buffer == torch.float32
+            is_fp32_grad=self.grad_dtype_in_buffer == torch.float32,
         )
 
         # NOTE: Allocate main param shards, all buffer will be on cpu.
@@ -281,7 +288,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         # NOTE: also alloc Adam states for each parameter
         exp_avg = self.chunk_manager.alloc_paired_tensors(torch.float32)
         exp_avg_sq = self.chunk_manager.alloc_paired_tensors(torch.float32)
-        
+
         for t, chunk_list in self.chunk_manager.paired_chunk_map.items():
             assert len(chunk_list) == 2
 
@@ -294,12 +301,12 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 state["exp_avg"] = exp_avg[p]
                 # gradient variances
                 state["exp_avg_sq"] = exp_avg_sq[p]
-                self.optimizer._post_state_init(p)               
+                self.optimizer._post_state_init(p)
 
         if self.policy == 'static':
             # NOTE: select partial chunks to GPU
             total_memory = self.chunk_manager.total_mem['cpu']
-            budget = round((1 - self.cpu_offload_fraction) * total_memory)
+            budget = round((1 - self.optimizer_offload_fraction) * total_memory)
             if budget > 0:
                 for _, chunks in self.chunk_manager.chunk_groups.items():
                     for chunk in chunks:
@@ -307,7 +314,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                         if self.chunk_manager.total_mem['cuda'] >= budget:
                             break
                     if self.chunk_manager.total_mem['cuda'] >= budget:
-                        break         
+                        break
         # Total: (2 + 4 + 4) = 10M or (2 + 4 + 4 + 4) = 14M [if an extra fp32 grad chunk is required]
         print('After initialization, parameter chunks use mem: ', self.chunk_manager.total_mem)
 
@@ -327,7 +334,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             self.shard_float16_groups,  # grad empty/unused here?
             self.shard_fp32_groups,  # throws grad-access warning
             self.shard_fp32_from_float16_groups,
-            self.shard_fp32_from_float32_groups
+            self.shard_fp32_from_float32_groups,
         ):
             for group in groups:
                 _zero_grad_group_helper(group, set_to_none=set_to_none)
@@ -341,11 +348,10 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         if self.overlap_param_gather:
             self._dispatch_gather_model_params(all_gather_handle_index=0)
 
-
     def preprocess_grads(self) -> bool:
         """
-            this function temperorarily generates a fp32 grad on cuda
-            and use grad_norm_clip then copy them to cpu
+        this function temperorarily generates a fp32 grad on cuda
+        and use grad_norm_clip then copy them to cpu
         """
         timers = self.config.timers
         # 1. collect fp32 grads from fp16 model
@@ -369,7 +375,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
             # Update across all model parallel instances.
             torch.distributed.all_reduce(
-                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+                self.found_inf,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.get_model_parallel_group(),
             )
 
             # Check for nan.
@@ -386,6 +394,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
+
         def _internal_get_main_grads_for_grad_norm(params):
             grads_for_norm = []
             for param in params:
@@ -398,7 +407,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                 if is_not_shared and is_not_tp_duplicate:
                     grads_for_norm.append(grad)
             return grads_for_norm
-        
+
         def _internal_clip_grad_by_total_norm_fp32(
             main_grads: Union[List[torch.Tensor], torch.Tensor],
             max_norm: Union[int, float],
@@ -414,7 +423,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             clip_coeff = max_norm / (total_norm + 1.0e-6)
             if clip_coeff < 1.0:
                 dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-                multi_tensor_applier(multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff)
+                multi_tensor_applier(
+                    multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+                )
 
         if self.config.clip_grad > 0.0:
             params = self.get_parameters()
@@ -471,7 +482,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
 
                     shard_main_grads.append(shard_model_grad.float())
-                    shard_main_param_id_to_shard_main_grad_mapping[id(shard_main_param)] = shard_main_grads[-1]
+                    shard_main_param_id_to_shard_main_grad_mapping[id(shard_main_param)] = (
+                        shard_main_grads[-1]
+                    )
 
         # Copy model groups to shard groups.
         collect_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
@@ -484,7 +497,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         for param in params:
             if id(param) in main_param_id_to_main_grad_mapping:
                 if param.grad is None:
-                    param.grad = main_param_id_to_main_grad_mapping[id(param)].to(param.device, non_blocking=True)
+                    param.grad = main_param_id_to_main_grad_mapping[id(param)].to(
+                        param.device, non_blocking=True
+                    )
                 else:
                     param.grad.data.copy_(main_param_id_to_main_grad_mapping[id(param)])
 
@@ -566,17 +581,13 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
         return self.update_successful
 
-    def update_layout(
-            self, 
-            mem_stats: MemStats = None,
-            threshold: int = None
-        ):
+    def update_layout(self, mem_stats: MemStats = None, threshold: int = None):
         if mem_stats is None:
             return
         if threshold is None:
-            threshold = self.auto_offload_threshold
-        # NOTE: assume in optimizer.step(), we need less non-model data 
-        # than forward-backward step, therefore make 
+            threshold = self.optimizer_offload_auto_threshold
+        # NOTE: assume in optimizer.step(), we need less non-model data
+        # than forward-backward step, therefore make
         # [chunk mem in CUDA] + threshold <= available space
         model_data = mem_stats._prev_md_cuda
         chunk_mem = self.chunk_manager.total_mem['cuda']
@@ -598,7 +609,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                         break
                 if available_space >= 0:
                     break
-  
+
         # otherwise try to move chunk to CUDA without violating memory constraints
         while True:
             chunk_to_be_moved = None
@@ -614,9 +625,11 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     break
             if chunk_to_be_moved is None:
                 break
-            self.chunk_manager.move_chunk(chunk_to_be_moved, torch.cuda.current_device(), async_move=False)
+            self.chunk_manager.move_chunk(
+                chunk_to_be_moved, torch.cuda.current_device(), async_move=False
+            )
             available_space -= required_mem
-        
+
         # new_chunk_mem = self.chunk_manager.total_mem['cuda']
         # new_model_data = new_chunk_mem - chunk_mem + model_data
         # overall_allocated = new_model_data + non_model_data # NOTE: should always less than physical mem
@@ -627,7 +640,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         #       f'Tensor Offload Ratio: {ratios["Tensor Offload Ratio"]}%\n')
 
     @torch.no_grad()
-    def step(self, mem_stats = None):
+    def step(self, mem_stats=None):
         if self.policy == 'auto':
             self.update_layout(mem_stats)
         success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
