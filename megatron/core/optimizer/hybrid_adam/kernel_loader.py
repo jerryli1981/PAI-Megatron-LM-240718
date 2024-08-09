@@ -438,7 +438,7 @@ class FusedOptimizerCudaExtension(_CudaExtension):
             self.csrc_abs_path(
                 "cuda/multi_tensor_adam_kernel.cu",
             ),
-            self.csrc_abs_path("optimizer/optimizer.cpp"),
+            self.csrc_abs_path("optimizer.cpp"),
         ]
         return ret
 
