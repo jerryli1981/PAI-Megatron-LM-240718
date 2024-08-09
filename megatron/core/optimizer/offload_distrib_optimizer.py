@@ -26,11 +26,6 @@ from .clip_grads import get_grad_norm_fp32
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import MegatronGradScaler
 from .hybrid_adam import CPUAdam
-from .optimizer import (
-    _zero_grad_group_helper,
-    multi_tensor_applier,
-    multi_tensor_scale_impl,
-)
 from .optimizer_config import OptimizerConfig
 
 __all__ = ['OffloadDistributedOptimizer']
@@ -328,6 +323,9 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
+        from .optimizer import (
+            _zero_grad_group_helper,
+        )
         for groups in (
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -413,6 +411,10 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             max_norm: Union[int, float],
             total_norm: float,
         ):
+            from .optimizer import (
+                multi_tensor_applier,
+                multi_tensor_scale_impl,
+            )
             # Grads.
             grads = []
             for g in main_grads:
