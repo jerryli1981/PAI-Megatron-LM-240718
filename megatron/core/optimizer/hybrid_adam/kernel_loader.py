@@ -436,9 +436,9 @@ class FusedOptimizerCudaExtension(_CudaExtension):
     def sources_files(self):
         ret = [
             self.csrc_abs_path(
-                "kernel/cuda/multi_tensor_adam_kernel.cu",
+                "cuda/multi_tensor_adam_kernel.cu",
             ),
-            self.csrc_abs_path("optimizer/optimizer.cpp"),
+            self.csrc_abs_path("optimizer.cpp"),
         ]
         return ret
 
