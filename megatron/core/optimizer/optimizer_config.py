@@ -55,7 +55,7 @@ class OptimizerConfig:
        dynamic loss scaling is used.
     """
 
-    initial_loss_scale: float = 2 ** 32
+    initial_loss_scale: float = 2**32
     """Initial loss-scale for dynamic loss scaling."""
 
     min_loss_scale: float = 1.0
@@ -100,16 +100,20 @@ class OptimizerConfig:
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute in distributed optimizer."""
 
-    cpu_offload_policy: str = 'static'
+    #######################
+    # Optimizer Offloading
+    #######################
+
+    optimizer_offload_policy: str = 'static'
     """CPU Offload Policy used by OffloadDistributedOptimizer, valid if base optimizer is HybridAdam"""
 
-    cpu_offload_fraction: float = 0.0
+    optimizer_offload_fraction: float = 0.0
     """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
 
-    cpu_offload_chunk_size: int = 0
+    optimizer_offload_chunk_size: int = 0
     """Chunk Size used by CPU offload Chunk Manager (bytes), automatically search if value is 0 (default)"""
 
-    auto_offload_threshold: int = 2048 * 1024 ** 2
+    optimizer_offload_auto_threshold: int = 2048 * 1024**2
     """threshold for auto optimizer offload (bytes) should be larger if OOM"""
 
     ################
