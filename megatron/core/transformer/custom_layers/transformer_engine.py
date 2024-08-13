@@ -470,10 +470,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "1.2.0"
             ), f"Transformer-Engine version ({str(_te_version)}) must be >= 1.2.0 to support sliding window attention."
             extra_kwargs['window_size'] = config.window_size
-
+        
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
-            kv_channels=self.config.kv_channels,
+            k_channels=self.config.kv_channels,
             attention_dropout=(
                 self.config.attention_dropout if attention_dropout is None else attention_dropout
             ),
