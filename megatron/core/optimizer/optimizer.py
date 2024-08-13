@@ -13,6 +13,7 @@ import torch
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+    multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
     try:
         from apex.multi_tensor_apply import multi_tensor_applier
