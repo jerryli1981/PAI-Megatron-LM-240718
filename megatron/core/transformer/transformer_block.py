@@ -150,10 +150,11 @@ class TransformerBlock(MegatronModule):
                 self.offload_context,
                 self.group_prefetch_offload_commit_async,
             ) = get_cpu_offload_context(
-                self.config.cpu_offloading,
-                self.config.cpu_offloading_num_layers,
-                self.config.cpu_offloading_activations,
-                self.config.cpu_offloading_weights,
+                enabled=self.config.cpu_offloading,
+                num_layers=self.config.cpu_offloading_num_layers,
+                model_layers=self.config.num_layers,
+                offload_activations=self.config.cpu_offloading_activations,
+                offload_weights=self.config.cpu_offloading_weights
             )
             self.config._cpu_offloading_context = (
                 self.offload_context if self.config.cpu_offloading else None
