@@ -590,7 +590,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         non_model_data = mem_stats.max_non_model_data('cuda')
 
         allocable_space = torch.cuda.memory_reserved() + \
-            torch.cuda.mem_get_info()[0]  - threshold
+            torch.cuda.mem_get_info()[0]  - self.optimizer_offload_auto_threshold
         available_space =  allocable_space - model_data - non_model_data
 
         # NOTE: small chunks are preferred to being moved.
