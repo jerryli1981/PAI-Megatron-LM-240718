@@ -218,6 +218,11 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         self.optimizer_offload_auto_threshold: int = config.optimizer_offload_auto_threshold
         self.policy = config.optimizer_offload_policy
 
+        # by default, warmup only try to use 80% CUDA mem, whereas 90% CUDA mem 
+        # in steps afterwards
+        self.optimizer_offload_auto_warmup_ratio = 0.8
+        self.optimizer_offload_auto_ratio = 0.9
+
         assert isinstance(
             optimizer, CPUAdam
         ), "Only CPUAdam currently supported, due to checkpointing requirements."
@@ -583,64 +588,70 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
 
         return self.update_successful
 
-    def update_layout(self, mem_stats: MemStats = None, threshold: int = None):
+    def update_layout(
+            self, 
+            mem_stats: MemStats = None, 
+            threshold: int = None,
+            is_warmup: bool = False
+        ):
         if mem_stats is None:
             return
-        if threshold is None:
-            threshold = self.optimizer_offload_auto_threshold
-        # NOTE: assume in optimizer.step(), we need less non-model data
-        # than forward-backward step, therefore make
-        # [chunk mem in CUDA] + threshold <= available space
+        
         model_data = mem_stats._prev_md_cuda
-        chunk_mem = self.chunk_manager.total_mem['cuda']
         non_model_data = mem_stats.max_non_model_data('cuda')
-
-        current_usage = torch.cuda.memory_reserved() - model_data - non_model_data
-        available_space = torch.cuda.mem_get_info()[0] + current_usage - threshold
+        if is_warmup:
+            allocable_space = torch.cuda.memory_reserved() + torch.cuda.mem_get_info()[0]
+            # alloc 16G nmd in A100
+            non_model_data_assume = max(
+                (1 - self.optimizer_offload_auto_warmup_ratio) * allocable_space,
+                non_model_data
+            )
+            allocable_space *= self.optimizer_offload_auto_ratio
+            available_space  = allocable_space - model_data - non_model_data_assume
+        else:
+            allocable_space = torch.cuda.memory_reserved() + torch.cuda.mem_get_info()[0]
+            allocable_space *= self.optimizer_offload_auto_ratio
+            available_space = allocable_space - model_data - non_model_data
 
         # if available sapce < 0, move some chunk to CPU
         if available_space < 0:
+            chunk_and_its_size = []
             for _, chunk_group in self.chunk_manager.chunk_groups.items():
                 for chunk in chunk_group:
                     if chunk.device_type == 'cpu':
                         continue
                     released_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
-                    self.chunk_manager.move_chunk(chunk, 'cpu', async_move=False)
-                    available_space += released_mem
-                    if available_space >= 0:
-                        break
+                    chunk_and_its_size.append(
+                        (chunk, released_mem)
+                    )
+
+            chunk_and_its_size.sort(key=lambda x: x[1])
+            for chunk, released_mem in chunk_and_its_size:                
+                self.chunk_manager.move_chunk(chunk, 'cpu')
+                available_space += released_mem
                 if available_space >= 0:
                     break
 
         # otherwise try to move chunk to CUDA without violating memory constraints
-        while True:
-            chunk_to_be_moved = None
-            for _, chunk_group in self.chunk_manager.chunk_groups.items():
-                for chunk in chunk_group:
-                    if chunk.device_type == 'cuda':
-                        continue
-                    required_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
-                    if required_mem < available_space:
-                        chunk_to_be_moved = chunk
-                        break
-                if chunk_to_be_moved is not None:
-                    break
-            if chunk_to_be_moved is None:
-                break
-            self.chunk_manager.move_chunk(
-                chunk_to_be_moved, torch.cuda.current_device(), async_move=False
-            )
-            available_space -= required_mem
+        chunk_and_its_size = []
+        for _, chunk_group in self.chunk_manager.chunk_groups.items():
+            for chunk in chunk_group:
+                if chunk.device_type == 'cuda':
+                    continue
+                required_mem = self.chunk_manager.calc_size_in_device(
+                    chunk, 'cuda')
+                chunk_and_its_size.append(
+                    (chunk, required_mem)
+                )
 
-        # new_chunk_mem = self.chunk_manager.total_mem['cuda']
-        # new_model_data = new_chunk_mem - chunk_mem + model_data
-        # overall_allocated = new_model_data + non_model_data # NOTE: should always less than physical mem
-        # ratios = self.chunk_manager.get_offload_ratio()
-        # print(f'rank: {get_rank()} Model-Data: {model_data} Max Overall: {mem_stats.max_overall_cuda} \n'
-        #       f'New Model-Data: {new_model_data} Assumed Max Usage: {overall_allocated}\n'
-        #       f'Max non-model data: {non_model_data} Chunk Offload Ratio: {ratios["Chunk Offload Ratio"]}%\n'
-        #       f'Tensor Offload Ratio: {ratios["Tensor Offload Ratio"]}%\n')
-
+        chunk_and_its_size.sort(key=lambda x: x[1])
+        for chunk, required_mem in chunk_and_its_size:
+            if required_mem < available_space:
+                self.chunk_manager.move_chunk(
+                    chunk, torch.cuda.current_device()
+                )
+                available_space -= required_mem
+                
     @torch.no_grad()
     def step(self, mem_stats=None):
         if self.policy == 'auto':
