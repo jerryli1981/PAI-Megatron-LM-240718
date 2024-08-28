@@ -394,5 +394,7 @@ def get_megatron_optimizer(
 
     if len(optimizers) == 1:
         return optimizers[0]
-
+    if config.optimizer == 'hybridadam':
+        from .offload_chained_optimizer import ChainedOffloadOptimizer
+        return ChainedOffloadOptimizer(optimizers)
     return ChainedOptimizer(optimizers)
