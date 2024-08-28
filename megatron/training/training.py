@@ -723,10 +723,6 @@ def train_step(
         )
 
         memory_stats_collector.sample_overall_data()
-        may_evict_tensor = memory_stats_collector.on_iter_end()
-        if optimizer.policy == 'auto' and may_evict_tensor and hasattr(optimizer, 'update_layout'):
-            print('Warmuping...')
-            optimizer.update_layout(memory_stats_collector.warmup_memstats)
 
     # Vision momentum.
     if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
