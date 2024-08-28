@@ -534,6 +534,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             )
         if self.policy == 'auto':
             self.update_layout(self._mem_stats)
+            self._mem_stats = None
+
         if timers is not None:
             timers('optimizer-update-layout').stop()      
 
@@ -662,3 +664,7 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
             timers('optimizer-copy-grad-to-cpu-and-gpu').stop()
 
         return super().step_with_ready_grads()
+
+    def step(self, mem_stats=None):
+        self._mem_stats = mem_stats
+        return super().step()
