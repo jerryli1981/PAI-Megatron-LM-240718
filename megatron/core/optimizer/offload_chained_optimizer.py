@@ -16,9 +16,19 @@ class ChainedOffloadOptimizer(ChainedOptimizer):
         self.chained_optimizers: List[OffloadDistributedOptimizer] = chained_optimizers
 
     @torch.no_grad()
+    def prepare_grads(self, mem_stats) -> bool:
+        """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
+        found_inf_flag = False
+        for optimizer in self.chained_optimizers:
+            optimizer._mem_stats = mem_stats
+            found_inf_flag |= optimizer.prepare_grads()
+
+        return found_inf_flag
+    
+    @torch.no_grad()
     def step(self, mem_stats=None):
         """ChainedOptimizer will step all optimizers one by one."""
-        found_inf_flag = self.prepare_grads()
+        found_inf_flag = self.prepare_grads(mem_stats)
         if found_inf_flag:
             return False, None, None
 
