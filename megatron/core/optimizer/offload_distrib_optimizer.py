@@ -346,113 +346,6 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         if self.overlap_param_gather:
             self._dispatch_gather_model_params(all_gather_handle_index=0)
 
-    def preprocess_grads(self) -> bool:
-        """
-        this function temperorarily generates a fp32 grad on cuda
-        and use grad_norm_clip then copy them to cpu
-        """
-        timers = self.config.timers
-        # 1. collect fp32 grads from fp16 model
-        params = None
-        main_grads, main_param_id_to_main_grad_mapping = self._collect_grads()
-
-        # 2. unscale / check inf
-        # Reset found inf.
-        if self.grad_scaler:
-            if timers is not None:
-                timers('optimizer-unscale-and-check-inf', log_level=1).start(
-                    barrier=self.config.barrier_with_L1_time
-                )
-
-            self.found_inf.fill_(0.0)
-
-            # Unscale and set found inf/nan
-            torch._amp_foreach_non_finite_check_and_unscale_(
-                main_grads, self.found_inf, self.grad_scaler.inv_scale
-            )
-
-            # Update across all model parallel instances.
-            torch.distributed.all_reduce(
-                self.found_inf,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.get_model_parallel_group(),
-            )
-
-            # Check for nan.
-            found_inf_flag = self.found_inf.item() > 0
-            if timers is not None:
-                timers('optimizer-unscale-and-check-inf').stop()
-
-            if found_inf_flag:
-                return False, None, None
-
-        # 3. compute grad norm and clip
-        if timers is not None:
-            timers('optimizer-clip-main-grad', log_level=1).start(
-                barrier=self.config.barrier_with_L1_time
-            )
-        grad_norm = None
-
-        def _internal_get_main_grads_for_grad_norm(params):
-            grads_for_norm = []
-            for param in params:
-                # O(n) to O(n^2)
-                if id(param) not in main_param_id_to_main_grad_mapping:
-                    continue
-                grad = main_param_id_to_main_grad_mapping[id(param)]
-                is_not_shared = param_is_not_shared(param)
-                is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
-                if is_not_shared and is_not_tp_duplicate:
-                    grads_for_norm.append(grad)
-            return grads_for_norm
-
-        def _internal_clip_grad_by_total_norm_fp32(
-            main_grads: Union[List[torch.Tensor], torch.Tensor],
-            max_norm: Union[int, float],
-            total_norm: float,
-        ):
-            from .optimizer import (
-                multi_tensor_applier,
-                multi_tensor_scale_impl,
-            )
-            # Grads.
-            grads = []
-            for g in main_grads:
-                assert g.type() == 'torch.cuda.FloatTensor'
-                grads.append(g.detach())
-
-            # Scale.
-            clip_coeff = max_norm / (total_norm + 1.0e-6)
-            if clip_coeff < 1.0:
-                dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-                multi_tensor_applier(
-                    multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-                )
-
-        if self.config.clip_grad > 0.0:
-            params = self.get_parameters()
-            grads_for_norm = _internal_get_main_grads_for_grad_norm(params)
-            grad_norm = get_grad_norm_fp32(
-                grads_for_norm, model_parallel_group=self.get_model_parallel_group()
-            )
-            _internal_clip_grad_by_total_norm_fp32(main_grads, self.config.clip_grad, grad_norm)
-        if timers is not None:
-            timers('optimizer-clip-main-grad').stop()
-
-        if timers is not None:
-            timers('optimizer-copy-grad-to-cpu-and-gpu', log_level=1).start(
-                barrier=self.config.barrier_with_L1_time
-            )
-
-        # 4. move these grads to CPU
-        self.chunk_manager.attach_grad()
-        self._dispatch_grads(params, main_param_id_to_main_grad_mapping)
-
-        if timers is not None:
-            timers('optimizer-copy-grad-to-cpu-and-gpu').stop()
-
-        return True, grad_norm, None
-
     def _get_model_and_main_params_data_float32(self):
         """
         Get aligned list of model and main params.
@@ -598,7 +491,8 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
         current_usage = torch.cuda.memory_reserved() - model_data - non_model_data
         available_space = torch.cuda.mem_get_info()[0] + current_usage - threshold
 
-        # if available sapce < 0, move some chunk to CPU
+        # NOTE: small chunks are preferred to being moved.
+        # We find this strategy is more stable than random select,
         if available_space < 0:
             for _, chunk_group in self.chunk_manager.chunk_groups.items():
                 for chunk in chunk_group:
@@ -613,40 +507,164 @@ class OffloadDistributedOptimizer(DistributedOptimizer):
                     break
 
         # otherwise try to move chunk to CUDA without violating memory constraints
-        while True:
-            chunk_to_be_moved = None
-            for _, chunk_group in self.chunk_manager.chunk_groups.items():
-                for chunk in chunk_group:
-                    if chunk.device_type == 'cuda':
-                        continue
-                    required_mem = self.chunk_manager.calc_size_in_device(chunk, 'cuda')
-                    if required_mem < available_space:
-                        chunk_to_be_moved = chunk
-                        break
-                if chunk_to_be_moved is not None:
-                    break
-            if chunk_to_be_moved is None:
-                break
-            self.chunk_manager.move_chunk(
-                chunk_to_be_moved, torch.cuda.current_device(), async_move=False
+        chunk_and_its_size = []
+        for _, chunk_group in self.chunk_manager.chunk_groups.items():
+            for chunk in chunk_group:
+                if chunk.device_type == 'cuda':
+                    continue
+                required_mem = self.chunk_manager.calc_size_in_device(
+                    chunk, 'cuda')
+                chunk_and_its_size.append(
+                    (chunk, required_mem)
+                )
+
+        chunk_and_its_size.sort(key=lambda x: x[1])
+        for chunk, required_mem in chunk_and_its_size:
+            if required_mem < available_space:
+                self.chunk_manager.move_chunk(
+                    chunk, torch.cuda.current_device()
+                )
+                available_space -= required_mem
+                
+    def prepare_grads(self) -> bool:
+        timers = self.config.timers
+        if timers is not None:
+            timers('optimizer-update-layout', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
             )
-            available_space -= required_mem
-
-        # new_chunk_mem = self.chunk_manager.total_mem['cuda']
-        # new_model_data = new_chunk_mem - chunk_mem + model_data
-        # overall_allocated = new_model_data + non_model_data # NOTE: should always less than physical mem
-        # ratios = self.chunk_manager.get_offload_ratio()
-        # print(f'rank: {get_rank()} Model-Data: {model_data} Max Overall: {mem_stats.max_overall_cuda} \n'
-        #       f'New Model-Data: {new_model_data} Assumed Max Usage: {overall_allocated}\n'
-        #       f'Max non-model data: {non_model_data} Chunk Offload Ratio: {ratios["Chunk Offload Ratio"]}%\n'
-        #       f'Tensor Offload Ratio: {ratios["Tensor Offload Ratio"]}%\n')
-
-    @torch.no_grad()
-    def step(self, mem_stats=None):
         if self.policy == 'auto':
-            self.update_layout(mem_stats)
-        success, grad_norm, num_zeros_in_grad = self.preprocess_grads()
-        if success:
-            success = self.step_with_ready_grads()
-        # Successful update.
-        return success, grad_norm, num_zeros_in_grad
+            self.update_layout(self._mem_stats)
+            self._mem_stats = None
+
+        if timers is not None:
+            timers('optimizer-update-layout').stop()      
+
+        (
+            self._main_grads, 
+            self._main_param_id_to_main_grad_mapping
+        ) = self._collect_grads()
+        
+        # 2. unscale / check inf
+        # Reset found inf.
+        if self.grad_scaler:
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+
+            self.found_inf.fill_(0.0)
+
+            # Unscale and set found inf/nan
+            torch._amp_foreach_non_finite_check_and_unscale_(
+                self._main_grads, self.found_inf, self.grad_scaler.inv_scale
+            )
+
+            # Update across all model parallel instances.
+            torch.distributed.all_reduce(
+                self.found_inf,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.get_model_parallel_group(),
+            )
+
+            # Check for nan.
+            found_inf_flag = self.found_inf.item() > 0
+            if timers is not None:
+                timers('optimizer-unscale-and-check-inf').stop()
+
+            if found_inf_flag:
+                self._main_grads = None
+                self._main_param_id_to_main_grad_mapping = None
+            return found_inf_flag
+        return False
+    
+    def get_main_grads_for_grad_norm(self):
+        main_param_id_to_main_grad_mapping = \
+            self._main_param_id_to_main_grad_mapping
+        params = self.get_parameters()
+        grads_for_norm = []
+        for param in params:
+            # O(n) to O(n^2)
+            if id(param) not in main_param_id_to_main_grad_mapping:
+                continue
+            grad = main_param_id_to_main_grad_mapping[id(param)]
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+            if is_not_shared and is_not_tp_duplicate:
+                grads_for_norm.append(grad)
+        return grads_for_norm
+
+    def clip_grad_norm(self, clip_grad: float) -> float:
+        grads_for_norm = self.get_main_grads_for_grad_norm()
+        total_norm = get_grad_norm_fp32(
+            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+        )
+        from .optimizer import (
+            multi_tensor_applier,
+            multi_tensor_scale_impl,
+        )
+        # Grads.
+        grads = []
+        for g in self._main_grads:
+            assert g.type() == 'torch.cuda.FloatTensor'
+            grads.append(g.detach())
+
+        # Scale.
+        clip_coeff = clip_grad / (total_norm + 1.0e-6)
+        if clip_coeff < 1.0:
+            dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+            multi_tensor_applier(
+                multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+            )
+
+        return total_norm
+
+    def count_zeros(self) -> float:
+        main_param_id_to_main_grad_mapping = \
+            self._main_param_id_to_main_grad_mapping
+        params = self.get_parameters()
+        total_num_zeros = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        for param in params:
+            # O(n) to O(n^2)
+            if id(param) not in main_param_id_to_main_grad_mapping:
+                continue
+            grad = main_param_id_to_main_grad_mapping[id(param)]
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+            if is_not_shared and is_not_tp_duplicate:
+                grad = grad.detach()
+                num_zeros = grad.numel() - torch.count_nonzero(grad)
+                total_num_zeros = num_zeros + total_num_zeros
+
+        # Sum across all model-parallel GPUs.
+        torch.distributed.all_reduce(
+            total_num_zeros, 
+            op=torch.distributed.ReduceOp.SUM, 
+            group=self.get_model_parallel_group()
+        )
+        total_num_zeros = total_num_zeros.item()
+        return total_num_zeros
+
+    def step_with_ready_grads(self):
+        timers = self.config.timers
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu-and-gpu', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        # 4. move these grads to CPU
+        self.chunk_manager.attach_grad()
+        params = self.get_parameters()
+        self._dispatch_grads(
+            params, self._main_param_id_to_main_grad_mapping
+        )
+
+        self._main_param_id_to_main_grad_mapping = None
+        self._main_grads = None
+
+        if timers is not None:
+            timers('optimizer-copy-grad-to-cpu-and-gpu').stop()
+
+        return super().step_with_ready_grads()
+
+    def step(self, mem_stats=None):
+        self._mem_stats = mem_stats
+        return super().step()
