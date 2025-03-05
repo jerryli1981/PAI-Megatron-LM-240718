@@ -604,7 +604,7 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
         return state_dict, checkpoint_name, release
 
     try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     except ModuleNotFoundError:
         from megatron.legacy.fp16_deprecated import loss_scaler
         # For backward compatibility.
@@ -615,7 +615,7 @@ def _load_base_checkpoint(load_dir, rank0=False, sharded_state_dict=None,
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
             'megatron.legacy.fp16_deprecated.loss_scaler']
         sys.modules['megatron.model'] = sys.modules['megatron.legacy.model']
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
         sys.modules.pop('megatron.model', None)
@@ -965,7 +965,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
+    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
     ret_state_dict = state_dict['model']
 
     if only_query_model:
